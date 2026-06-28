@@ -55,10 +55,86 @@ const char *conduit_packet_type_name(uint8_t type) {
     switch (type) {
         case CONDUIT_PKT_HANDSHAKE_INIT: return "HANDSHAKE_INIT";
         case CONDUIT_PKT_HANDSHAKE_RESP: return "HANDSHAKE_RESP";
+        case CONDUIT_PKT_HANDSHAKE_CONFIRM: return "HANDSHAKE_CONFIRM";
         case CONDUIT_PKT_DATA:           return "DATA";
         case CONDUIT_PKT_HEARTBEAT:      return "HEARTBEAT";
         case CONDUIT_PKT_HEARTBEAT_ACK:  return "HEARTBEAT_ACK";
         case CONDUIT_PKT_CLOSE:          return "CLOSE";
         default:                         return "UNKNOWN";
     }
+}
+
+/* ============================================================================
+ * Handshake builders and parsers
+ *
+ * A handshake packet is the fixed header (Section 2.2 of the spec) followed by
+ * a small body. Builders produce a complete packet; parsers read the body of a
+ * packet whose fixed header has already been validated by conduit_header_decode().
+ * ========================================================================== */
+
+/* Read/write fixed-width integers in network byte order at a given offset. */
+static void put_u32(uint8_t *p, uint32_t v) {
+    uint32_t be = htonl(v);
+    memcpy(p, &be, 4);
+}
+static uint32_t get_u32(const uint8_t *p) {
+    uint32_t be;
+    memcpy(&be, p, 4);
+    return ntohl(be);
+}
+
+size_t conduit_build_init(uint32_t initiator_cid, uint8_t *buf, size_t cap) {
+    if (cap < CONDUIT_INIT_SIZE) return 0;
+    /* INIT is addressed to a not-yet-known responder: header CID is unspecified. */
+    conduit_header h = { CONDUIT_CID_UNSPECIFIED, CONDUIT_PKT_HANDSHAKE_INIT, 0 };
+    conduit_header_encode(&h, buf);
+    buf[CONDUIT_HEADER_SIZE + 0] = CONDUIT_PROTOCOL_VERSION;
+    put_u32(buf + CONDUIT_HEADER_SIZE + 1, initiator_cid);
+    return CONDUIT_INIT_SIZE;
+}
+
+size_t conduit_build_resp(uint32_t initiator_cid, uint32_t responder_cid,
+                          uint32_t token, uint8_t *buf, size_t cap) {
+    if (cap < CONDUIT_RESP_SIZE) return 0;
+    /* RESP is addressed to the initiator, by the ID it chose. */
+    conduit_header h = { initiator_cid, CONDUIT_PKT_HANDSHAKE_RESP, 0 };
+    conduit_header_encode(&h, buf);
+    buf[CONDUIT_HEADER_SIZE + 0] = CONDUIT_PROTOCOL_VERSION;
+    put_u32(buf + CONDUIT_HEADER_SIZE + 1, responder_cid);
+    put_u32(buf + CONDUIT_HEADER_SIZE + 5, token);
+    return CONDUIT_RESP_SIZE;
+}
+
+size_t conduit_build_confirm(uint32_t responder_cid, uint32_t token,
+                             uint8_t *buf, size_t cap) {
+    if (cap < CONDUIT_CONFIRM_SIZE) return 0;
+    /* CONFIRM is addressed to the responder, by the ID it chose. */
+    conduit_header h = { responder_cid, CONDUIT_PKT_HANDSHAKE_CONFIRM, 0 };
+    conduit_header_encode(&h, buf);
+    put_u32(buf + CONDUIT_HEADER_SIZE + 0, token);
+    return CONDUIT_CONFIRM_SIZE;
+}
+
+conduit_result conduit_parse_init(const uint8_t *buf, size_t len,
+                                  conduit_handshake_init *out) {
+    if (len < CONDUIT_INIT_SIZE) return CONDUIT_ERR_TOO_SHORT;
+    out->version       = buf[CONDUIT_HEADER_SIZE + 0];
+    out->initiator_cid = get_u32(buf + CONDUIT_HEADER_SIZE + 1);
+    return CONDUIT_OK;
+}
+
+conduit_result conduit_parse_resp(const uint8_t *buf, size_t len,
+                                  conduit_handshake_resp *out) {
+    if (len < CONDUIT_RESP_SIZE) return CONDUIT_ERR_TOO_SHORT;
+    out->version       = buf[CONDUIT_HEADER_SIZE + 0];
+    out->responder_cid = get_u32(buf + CONDUIT_HEADER_SIZE + 1);
+    out->token         = get_u32(buf + CONDUIT_HEADER_SIZE + 5);
+    return CONDUIT_OK;
+}
+
+conduit_result conduit_parse_confirm(const uint8_t *buf, size_t len,
+                                     conduit_handshake_confirm *out) {
+    if (len < CONDUIT_CONFIRM_SIZE) return CONDUIT_ERR_TOO_SHORT;
+    out->token = get_u32(buf + CONDUIT_HEADER_SIZE + 0);
+    return CONDUIT_OK;
 }

@@ -150,14 +150,15 @@ select the decryption context before any payload can be decrypted.
 
 **Type (8 bits).** Identifies the packet's purpose. Defined values:
 
-| Value  | Name             | Direction             | Purpose                        |
-| ------ | ---------------- | --------------------- | ------------------------------ |
-| `0x01` | `HANDSHAKE_INIT` | initiator → responder | Begin connection establishment |
-| `0x02` | `HANDSHAKE_RESP` | responder → initiator | Accept; carry address token    |
-| `0x10` | `DATA`           | either                | Application payload            |
-| `0x20` | `HEARTBEAT`      | either                | Liveness probe; drives RTT     |
-| `0x21` | `HEARTBEAT_ACK`  | either                | Reply to a heartbeat           |
-| `0x30` | `CLOSE`          | either                | Best-effort connection close   |
+| Value  | Name                | Direction             | Purpose                        |
+| ------ | ------------------- | --------------------- | ------------------------------ |
+| `0x01` | `HANDSHAKE_INIT`    | initiator → responder | Begin connection establishment |
+| `0x02` | `HANDSHAKE_RESP`    | responder → initiator | Accept; carry CID and token    |
+| `0x03` | `HANDSHAKE_CONFIRM` | initiator → responder | Echo token; finish handshake   |
+| `0x10` | `DATA`              | either                | Application payload            |
+| `0x20` | `HEARTBEAT`         | either                | Liveness probe; drives RTT     |
+| `0x21` | `HEARTBEAT_ACK`     | either                | Reply to a heartbeat           |
+| `0x30` | `CLOSE`             | either                | Best-effort connection close   |
 
 A receiver that does not recognize the Type value MUST discard the packet. The
 detailed exchange semantics of each type are specified in Sections 3 through 5.
@@ -189,8 +190,79 @@ not yet specified.
 
 ## 3. Connection Lifecycle
 
-_To be specified:_ handshake (with address-validation token), keep-alive,
-round-trip-time measurement, and termination.
+### 3.1. Handshake
+
+A connection is established with a three-message handshake. Because UDP is
+connectionless and these packets cannot rely on the (not-yet-established)
+reliability layer, the handshake is defined to be robust to loss on its own.
+Loss handling (retransmission with timeout) is specified in a later revision.
+
+```
+ Initiator                                   Responder
+     |                                            |
+     |----------------- INIT -------------------->|   version + CID_I
+     |                                            |
+     |<---------------- RESP ---------------------|   version + CID_R + token
+     |                                            |
+     |---------------- CONFIRM ------------------>|   echo token
+     |                                            |
+ ESTABLISHED                                  ESTABLISHED
+```
+
+**Connection ID assignment.** Each endpoint assigns the Connection ID by which
+it wishes to be addressed and communicates it during the handshake: the
+initiator in INIT, the responder in RESP. Thereafter a packet carries the
+_destination's_ Connection ID in its header. The value 0 is reserved to mean
+"unspecified" and MUST NOT be assigned by an endpoint; it appears only in the
+INIT header, where the responder's ID is not yet known.
+
+**Address-validation token.** The token in RESP lets the responder confirm that
+the initiator can receive datagrams at its claimed source address (return
+routability): the initiator MUST echo the token in CONFIRM, and the responder
+MUST reject a CONFIRM whose token does not match the one it issued. In this
+revision the token is a non-cryptographic value and provides round-trip
+confirmation only; it does NOT authenticate the peer or defend against an
+attacker able to observe traffic. A keyed, stateless token providing
+anti-spoofing is deferred to a later revision; the message flow and the token
+field are specified now so that the hardening requires no wire change.
+
+**Version.** INIT and RESP each carry the sender's protocol version. A receiver
+that does not support the offered version MUST reject the connection. This
+revision performs no version negotiation.
+
+#### 3.1.1. Message bodies
+
+Each handshake packet is the fixed header (Section 2.2) followed by the body
+below. All integer fields are in network byte order.
+
+INIT (type `0x01`), header Connection ID = 0 (unspecified):
+
+| Field         | Octets | Description                           |
+| ------------- | ------ | ------------------------------------- |
+| Version       | 1      | Initiator's protocol version          |
+| Initiator CID | 4      | Connection ID chosen by the initiator |
+
+RESP (type `0x02`), header Connection ID = Initiator CID:
+
+| Field         | Octets | Description                           |
+| ------------- | ------ | ------------------------------------- |
+| Version       | 1      | Responder's protocol version          |
+| Responder CID | 4      | Connection ID chosen by the responder |
+| Token         | 4      | Address-validation token              |
+
+CONFIRM (type `0x03`), header Connection ID = Responder CID:
+
+| Field | Octets | Description                      |
+| ----- | ------ | -------------------------------- |
+| Token | 4      | The token from RESP, echoed back |
+
+### 3.2. Keep-Alive and RTT Measurement
+
+_To be specified._
+
+### 3.3. Termination
+
+_To be specified._
 
 ## 4. Reliability Model
 
@@ -220,5 +292,8 @@ trusted.
 - `draft-conduit-00` — Initial draft. Document structure; introduction, scope,
   non-goals, design principles, and terminology. Section 2 (Packet Format)
   defines the fixed header (Connection ID, Type, Flags), the wire conventions,
-  and the critical/ignorable flag partition. Remaining wire-format sections are
+  and the critical/ignorable flag partition. Section 3.1 defines the
+  three-message handshake (INIT / RESP / CONFIRM), connection-ID assignment, the
+  address-validation token, and version handling; packet type `0x03`
+  (HANDSHAKE_CONFIRM) added. Remaining lifecycle and wire-format sections are
   placeholders pending implementation.
