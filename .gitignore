@@ -1,0 +1,40 @@
+# Compiled binaries / spike output
+udp_hello
+
+# Object files & libraries
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# Build directories
+build/
+out/
+cmake-build-*/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile.cmake
+
+# Debug / profiling
+*.dSYM/
+*.gcda
+*.gcno
+*.gcov
+core
+vgcore.*
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
