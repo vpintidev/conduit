@@ -117,32 +117,98 @@ Conduit explicitly does NOT aim to:
 
 ## 2. Packet Format
 
-*To be specified.* The next revision defines the fixed Conduit header —
-Connection ID, packet type, and a flags field — together with the OPTIONAL,
-flag-gated sections carrying reliability and messaging metadata.
+### 2.1. Wire Conventions
+
+- All multi-octet integer fields are encoded in **network byte order**
+  (big-endian).
+- All fields defined in this revision are **fixed-width**. Variable-width
+  encoding MAY be introduced in a later revision for specific fields.
+- A receiver MUST verify that a received datagram is at least
+  `CONDUIT_HEADER_SIZE` (7) octets long before interpreting any field. A
+  datagram shorter than the fixed header MUST be discarded.
+
+### 2.2. Fixed Header
+
+Every Conduit packet begins with a fixed 7-octet header:
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                        Connection ID                          |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|     Type      |             Flags             |  Payload ...
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+**Connection ID (32 bits).** The Connection ID of the _destination_ endpoint:
+the identifier the receiving endpoint assigned to itself during the handshake
+(Section 3). On receipt, an endpoint uses this field to demultiplex the packet
+to the correct connection. The Connection ID MUST be carried in cleartext even
+when the OPTIONAL cryptographic layer is in use, because it is required to
+select the decryption context before any payload can be decrypted.
+
+**Type (8 bits).** Identifies the packet's purpose. Defined values:
+
+| Value  | Name             | Direction             | Purpose                        |
+| ------ | ---------------- | --------------------- | ------------------------------ |
+| `0x01` | `HANDSHAKE_INIT` | initiator → responder | Begin connection establishment |
+| `0x02` | `HANDSHAKE_RESP` | responder → initiator | Accept; carry address token    |
+| `0x10` | `DATA`           | either                | Application payload            |
+| `0x20` | `HEARTBEAT`      | either                | Liveness probe; drives RTT     |
+| `0x21` | `HEARTBEAT_ACK`  | either                | Reply to a heartbeat           |
+| `0x30` | `CLOSE`          | either                | Best-effort connection close   |
+
+A receiver that does not recognize the Type value MUST discard the packet. The
+detailed exchange semantics of each type are specified in Sections 3 through 5.
+
+**Flags (16 bits).** A bit field, with bits numbered 0 (least significant)
+through 15 (most significant). The field is partitioned into two classes by
+position, which determines how a receiver MUST treat an unrecognized flag bit:
+
+- **Bits 8–15 — Critical class.** If a receiver encounters a bit set in this
+  range that it does not recognize, it MUST discard the packet. A critical flag
+  may change the interpretation of the packet, so a receiver that cannot
+  interpret it MUST NOT proceed.
+- **Bits 0–7 — Ignorable class.** A receiver MUST ignore any bit set in this
+  range that it does not recognize, and MUST process the remainder of the packet
+  normally. An ignorable flag is purely additive.
+
+This revision defines no flag bits. A sender conforming to this revision MUST
+set the Flags field to zero. (Subsequent revisions assign individual bits — for
+example, to signal the presence of the optional sections in Section 2.3 — within
+the class boundaries fixed above.)
+
+### 2.3. Optional Sections
+
+Following the fixed header, a packet MAY carry additional sections — reliability
+metadata (Section 4) and messaging metadata (Section 5) — whose presence is
+indicated by Flags bits defined in later revisions. When no such bits are set,
+the payload (if any) immediately follows the fixed header. These sections are
+not yet specified.
 
 ## 3. Connection Lifecycle
 
-*To be specified:* handshake (with address-validation token), keep-alive,
+_To be specified:_ handshake (with address-validation token), keep-alive,
 round-trip-time measurement, and termination.
 
 ## 4. Reliability Model
 
-*To be specified:* sequence numbers, acknowledgements, retransmission, duplicate
+_To be specified:_ sequence numbers, acknowledgements, retransmission, duplicate
 detection, and ordering.
 
 ## 5. Channels and Messages
 
-*To be specified:* per-channel guarantees, framing, fragmentation, and reassembly.
+_To be specified:_ per-channel guarantees, framing, fragmentation, and reassembly.
 
 ## 6. Versioning and Extensibility
 
-*To be specified:* protocol-version negotiation, the critical/ignorable flag
+_To be specified:_ protocol-version negotiation, the critical/ignorable flag
 partition, and the second-order extension mechanism.
 
 ## 7. Security Considerations
 
-*To be specified.* Note: in the absence of the OPTIONAL cryptographic layer,
+_To be specified._ Note: in the absence of the OPTIONAL cryptographic layer,
 Conduit provides no protection against spoofing, replay, or tampering, and MUST
 NOT be relied upon for confidentiality or authenticity. Even without
 cryptography, an implementation MUST remain robust against malformed, truncated,
@@ -152,5 +218,7 @@ trusted.
 ## Appendix A. Revision History
 
 - `draft-conduit-00` — Initial draft. Document structure; introduction, scope,
-  non-goals, design principles, and terminology. Wire-format sections are
+  non-goals, design principles, and terminology. Section 2 (Packet Format)
+  defines the fixed header (Connection ID, Type, Flags), the wire conventions,
+  and the critical/ignorable flag partition. Remaining wire-format sections are
   placeholders pending implementation.
