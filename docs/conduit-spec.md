@@ -258,7 +258,49 @@ CONFIRM (type `0x03`), header Connection ID = Responder CID:
 
 ### 3.2. Keep-Alive and RTT Measurement
 
-_To be specified._
+Once a connection is established, each endpoint detects whether its peer is still
+reachable and measures the connection's round-trip time using a heartbeat
+exchange.
+
+HEARTBEAT and HEARTBEAT_ACK packets each consist of the fixed header (Section
+2.2) followed by a 4-octet body. All integer fields are in network byte order.
+
+HEARTBEAT (type `0x20`), header Connection ID = destination CID:
+
+| Field    | Octets | Description                               |
+| -------- | ------ | ----------------------------------------- |
+| Sequence | 4      | Monotonically increasing probe identifier |
+
+HEARTBEAT_ACK (type `0x21`), header Connection ID = destination CID:
+
+| Field    | Octets | Description                                   |
+| -------- | ------ | --------------------------------------------- |
+| Sequence | 4      | The Sequence value from the HEARTBEAT, echoed |
+
+**Procedure.** An endpoint sending a HEARTBEAT chooses a Sequence value greater
+than any it has previously used on the connection and records the local time of
+transmission. On receiving a HEARTBEAT, an endpoint MUST reply with a
+HEARTBEAT_ACK echoing the same Sequence value; it retains no state to do so. On
+receiving a HEARTBEAT_ACK, the original sender matches the echoed Sequence to its
+recorded transmission time and computes the round-trip time as
+`now - transmission_time`.
+
+**RTT is measured entirely on the sender's own clock.** The Sequence value is an
+opaque label used only to match an acknowledgement to its probe; no timestamp or
+clock value crosses the network, and the two endpoints' clocks need not be
+synchronized.
+
+**Idle-only.** Heartbeats are sent only when the connection is otherwise idle:
+any packet sent on the connection resets the heartbeat timer, and a HEARTBEAT is
+emitted only after the timer elapses with no other traffic. Application data and
+acknowledgements therefore serve as implicit liveness signals.
+
+**Liveness failure.** If repeated heartbeats elicit no acknowledgement within an
+implementation-defined bound, the endpoint declares the connection lost. This is
+a local decision (see "local truth", Section 1.4); the two endpoints may detect
+loss at different times. The specific timing parameters (heartbeat interval,
+failure threshold) and the mechanism that drives them are implementation concerns
+and are not part of the wire format.
 
 ### 3.3. Termination
 
@@ -295,5 +337,8 @@ trusted.
   and the critical/ignorable flag partition. Section 3.1 defines the
   three-message handshake (INIT / RESP / CONFIRM), connection-ID assignment, the
   address-validation token, and version handling; packet type `0x03`
-  (HANDSHAKE_CONFIRM) added. Remaining lifecycle and wire-format sections are
-  placeholders pending implementation.
+  (HANDSHAKE_CONFIRM) added. Section 3.2 defines the HEARTBEAT / HEARTBEAT_ACK
+  packet bodies (a 4-octet Sequence), the echo-based RTT correlation measured on
+  the sender's own clock, the idle-only rule, and local liveness-failure
+  detection. Remaining lifecycle and wire-format sections are placeholders
+  pending implementation.
