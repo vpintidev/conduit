@@ -1,3 +1,5 @@
+[![CI](https://github.com/vpintidev/conduit/actions/workflows/ci.yml/badge.svg)](https://github.com/vpintidev/conduit/actions/workflows/ci.yml)
+
 # Conduit
 
 A modular, layered communication protocol over UDP.

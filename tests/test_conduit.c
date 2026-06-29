@@ -1,98 +1,97 @@
-#include "conduit.h"
-#include <stdio.h>
+// test_conduit.c — Unit tests for the Conduit wire primitives.
+//
+// Uses the minimal helper in test.h: each TEST(...) names a group, each
+// CHECK*(...) asserts without aborting, and test_summary() prints the result and
+// returns the exit code (0 = all passed).
+//
+// Build & run:  make test
 
-static void hexdump(const uint8_t *buf, size_t len) {
-    for (size_t i = 0; i < len; i++) printf("%02x ", buf[i]);
-    printf("\n");
-}
+#include "conduit.h"
+#include "test.h"
 
 int main(void) {
-    /* 1. Build a header in memory. */
-    conduit_header out = {
-        .connection_id = 0xABCD1234u,
-        .type          = CONDUIT_PKT_HEARTBEAT,
-        .flags         = 0
-    };
+    uint8_t buf[64];
+    conduit_header h;
 
-    /* 2. Encode it to the wire format and show the raw bytes.
-     *    Expect: ab cd 12 34   (connection ID, big-endian)
-     *            20            (type = HEARTBEAT)
-     *            00 00         (flags) */
-    uint8_t buf[CONDUIT_HEADER_SIZE];
-    size_t n = conduit_header_encode(&out, buf);
-    printf("encoded %zu bytes: ", n);
-    hexdump(buf, n);
+    /* ---- fixed header ---- */
+    TEST("fixed header round-trip");
+    conduit_header src = { 0xABCD1234u, CONDUIT_PKT_DATA, 0 };
+    size_t n = conduit_header_encode(&src, buf);
+    CHECK_EQ_SIZE(n, CONDUIT_HEADER_SIZE);
+    CHECK(conduit_header_decode(buf, n, &h) == CONDUIT_OK);
+    CHECK_EQ_U32(h.connection_id, 0xABCD1234u);
+    CHECK(h.type == CONDUIT_PKT_DATA);
+    CHECK_EQ_U32(h.flags, 0u);
 
-    /* 3. Decode it back and check the values survived the round trip. */
-    conduit_header in;
-    conduit_result r = conduit_header_decode(buf, n, &in);
-    if (r != CONDUIT_OK) {
-        printf("decode FAILED with code %d\n", (int)r);
-        return 1;
-    }
-    printf("decoded: connection_id=0x%08X  type=%s(0x%02X)  flags=0x%04X\n",
-           (unsigned)in.connection_id,
-           conduit_packet_type_name(in.type), (unsigned)in.type,
-           (unsigned)in.flags);
+    TEST("reject truncated header");
+    CHECK(conduit_header_decode(buf, 3, &h) == CONDUIT_ERR_TOO_SHORT);
 
-    int ok = (in.connection_id == out.connection_id)
-          && (in.type == out.type)
-          && (in.flags == out.flags);
-    printf("round-trip: %s\n", ok ? "OK" : "MISMATCH");
+    TEST("reject unknown critical flag");
+    /* A critical flag bit (high byte) undefined in this revision must be rejected. */
+    conduit_header crit = { 1u, CONDUIT_PKT_DATA, 0x0100u };
+    conduit_header_encode(&crit, buf);
+    CHECK(conduit_header_decode(buf, CONDUIT_HEADER_SIZE, &h) == CONDUIT_ERR_UNKNOWN_CRITICAL);
 
-    /* 4. Feed a truncated (3-byte) buffer and confirm the parser refuses it. */
-    conduit_header dummy;
-    conduit_result short_r = conduit_header_decode(buf, 3, &dummy);
-    int short_ok = (short_r == CONDUIT_ERR_TOO_SHORT);
-    printf("decode of 3-byte buffer: %s (expected rejection)\n",
-           short_ok ? "rejected cleanly" : "WRONGLY ACCEPTED");
-
-    /* 5. Handshake round-trips: build each message, then parse it back. */
-    printf("\n-- handshake round-trips --\n");
-    uint8_t pkt[64];
-    conduit_header ph;
-
-    size_t in_len = conduit_build_init(0x11111111u, pkt, sizeof(pkt));
-    conduit_header_decode(pkt, in_len, &ph);
+    /* ---- handshake ---- */
+    TEST("handshake INIT round-trip");
+    size_t in_len = conduit_build_init(0x11111111u, buf, sizeof(buf));
+    CHECK_EQ_SIZE(in_len, CONDUIT_INIT_SIZE);
+    CHECK(conduit_header_decode(buf, in_len, &h) == CONDUIT_OK);
+    CHECK(h.type == CONDUIT_PKT_HANDSHAKE_INIT);
+    CHECK_EQ_U32(h.connection_id, CONDUIT_CID_UNSPECIFIED);
     conduit_handshake_init hi;
-    conduit_parse_init(pkt, in_len, &hi);
-    int init_ok = (ph.type == CONDUIT_PKT_HANDSHAKE_INIT)
-               && (ph.connection_id == CONDUIT_CID_UNSPECIFIED)
-               && (hi.version == CONDUIT_PROTOCOL_VERSION)
-               && (hi.initiator_cid == 0x11111111u);
-    printf("INIT    (%zu bytes): initiator_cid=0x%08X version=%u -> %s\n",
-           in_len, (unsigned)hi.initiator_cid, (unsigned)hi.version,
-           init_ok ? "ok" : "FAIL");
+    CHECK(conduit_parse_init(buf, in_len, &hi) == CONDUIT_OK);
+    CHECK_EQ_U32(hi.version, CONDUIT_PROTOCOL_VERSION);
+    CHECK_EQ_U32(hi.initiator_cid, 0x11111111u);
 
-    size_t rs_len = conduit_build_resp(0x11111111u, 0x22222222u, 0xDEADBEEFu, pkt, sizeof(pkt));
-    conduit_header_decode(pkt, rs_len, &ph);
+    TEST("handshake RESP round-trip");
+    size_t rs_len = conduit_build_resp(0x11111111u, 0x22222222u, 0xDEADBEEFu, buf, sizeof(buf));
+    CHECK_EQ_SIZE(rs_len, CONDUIT_RESP_SIZE);
+    CHECK(conduit_header_decode(buf, rs_len, &h) == CONDUIT_OK);
+    CHECK(h.type == CONDUIT_PKT_HANDSHAKE_RESP);
+    CHECK_EQ_U32(h.connection_id, 0x11111111u);   /* addressed to initiator */
     conduit_handshake_resp hr;
-    conduit_parse_resp(pkt, rs_len, &hr);
-    int resp_ok = (ph.type == CONDUIT_PKT_HANDSHAKE_RESP)
-               && (ph.connection_id == 0x11111111u)   /* addressed to initiator */
-               && (hr.responder_cid == 0x22222222u)
-               && (hr.token == 0xDEADBEEFu);
-    printf("RESP    (%zu bytes): responder_cid=0x%08X token=0x%08X -> %s\n",
-           rs_len, (unsigned)hr.responder_cid, (unsigned)hr.token,
-           resp_ok ? "ok" : "FAIL");
+    CHECK(conduit_parse_resp(buf, rs_len, &hr) == CONDUIT_OK);
+    CHECK_EQ_U32(hr.responder_cid, 0x22222222u);
+    CHECK_EQ_U32(hr.token, 0xDEADBEEFu);
 
-    size_t cf_len = conduit_build_confirm(0x22222222u, 0xDEADBEEFu, pkt, sizeof(pkt));
-    conduit_header_decode(pkt, cf_len, &ph);
+    TEST("handshake CONFIRM round-trip");
+    size_t cf_len = conduit_build_confirm(0x22222222u, 0xDEADBEEFu, buf, sizeof(buf));
+    CHECK_EQ_SIZE(cf_len, CONDUIT_CONFIRM_SIZE);
+    CHECK(conduit_header_decode(buf, cf_len, &h) == CONDUIT_OK);
+    CHECK(h.type == CONDUIT_PKT_HANDSHAKE_CONFIRM);
+    CHECK_EQ_U32(h.connection_id, 0x22222222u);   /* addressed to responder */
     conduit_handshake_confirm hc;
-    conduit_parse_confirm(pkt, cf_len, &hc);
-    int conf_ok = (ph.type == CONDUIT_PKT_HANDSHAKE_CONFIRM)
-               && (ph.connection_id == 0x22222222u)   /* addressed to responder */
-               && (hc.token == 0xDEADBEEFu);
-    printf("CONFIRM (%zu bytes): token=0x%08X -> %s\n",
-           cf_len, (unsigned)hc.token, conf_ok ? "ok" : "FAIL");
+    CHECK(conduit_parse_confirm(buf, cf_len, &hc) == CONDUIT_OK);
+    CHECK_EQ_U32(hc.token, 0xDEADBEEFu);
 
-    conduit_handshake_init htmp;
-    int hs_short_ok =
-        (conduit_parse_init(pkt, CONDUIT_HEADER_SIZE + 2, &htmp) == CONDUIT_ERR_TOO_SHORT);
-    printf("truncated INIT body: %s\n",
-           hs_short_ok ? "rejected cleanly" : "WRONGLY ACCEPTED");
+    TEST("reject truncated handshake body");
+    conduit_handshake_init hi2;
+    CHECK(conduit_parse_init(buf, CONDUIT_HEADER_SIZE + 2, &hi2) == CONDUIT_ERR_TOO_SHORT);
 
-    int all_ok = ok && short_ok && init_ok && resp_ok && conf_ok && hs_short_ok;
-    printf("\nALL TESTS: %s\n", all_ok ? "PASS" : "FAIL");
-    return all_ok ? 0 : 1;
+    /* ---- heartbeat ---- */
+    TEST("heartbeat round-trip");
+    size_t hb_len = conduit_build_heartbeat(0x0000BBBBu, 42u, buf, sizeof(buf));
+    CHECK_EQ_SIZE(hb_len, CONDUIT_HEARTBEAT_SIZE);
+    CHECK(conduit_header_decode(buf, hb_len, &h) == CONDUIT_OK);
+    CHECK(h.type == CONDUIT_PKT_HEARTBEAT);
+    CHECK_EQ_U32(h.connection_id, 0x0000BBBBu);
+    conduit_heartbeat hb;
+    CHECK(conduit_parse_heartbeat(buf, hb_len, &hb) == CONDUIT_OK);
+    CHECK_EQ_U32(hb.sequence, 42u);
+
+    TEST("heartbeat ACK round-trip");
+    size_t ha_len = conduit_build_heartbeat_ack(0x0000AAAAu, 7u, buf, sizeof(buf));
+    CHECK_EQ_SIZE(ha_len, CONDUIT_HEARTBEAT_SIZE);
+    CHECK(conduit_header_decode(buf, ha_len, &h) == CONDUIT_OK);
+    CHECK(h.type == CONDUIT_PKT_HEARTBEAT_ACK);
+    conduit_heartbeat ha;
+    CHECK(conduit_parse_heartbeat(buf, ha_len, &ha) == CONDUIT_OK);
+    CHECK_EQ_U32(ha.sequence, 7u);
+
+    TEST("reject truncated heartbeat body");
+    conduit_heartbeat hb2;
+    CHECK(conduit_parse_heartbeat(buf, CONDUIT_HEADER_SIZE + 1, &hb2) == CONDUIT_ERR_TOO_SHORT);
+
+    return test_summary();
 }

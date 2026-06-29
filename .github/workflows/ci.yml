@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    name: build & test (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build everything and run tests
+        run: make all test CC=${{ matrix.cc }}
+
+  sanitizers:
+    name: address + undefined sanitizers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test with ASan + UBSan
+        run: |
+          make test CC=clang \
+            EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"

@@ -6,8 +6,8 @@
 #   make example    build the udp_hello example
 #   make clean      remove all build artifacts
 
-CC      := cc
-CFLAGS  := -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Isrc
+CC      ?= cc
+CFLAGS  := -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Isrc $(EXTRA_CFLAGS)
 BUILD   := build
 
 LIB_SRC := src/conduit.c
@@ -27,7 +27,9 @@ $(LIB_OBJ): $(LIB_SRC) src/conduit.h | $(BUILD)
 	$(CC) $(CFLAGS) -c $(LIB_SRC) -o $@
 
 # The test links the test driver against the library object.
-$(TEST_BIN): tests/test_conduit.c $(LIB_OBJ) | $(BUILD)
+# The test links the test driver against the library object. It depends on the
+# headers it includes, so editing a header triggers a rebuild.
+$(TEST_BIN): tests/test_conduit.c tests/test.h src/conduit.h $(LIB_OBJ) | $(BUILD)
 	$(CC) $(CFLAGS) $< $(LIB_OBJ) -o $@
 
 test: $(TEST_BIN)

@@ -127,4 +127,33 @@ conduit_result conduit_parse_resp(const uint8_t *buf, size_t len,
 conduit_result conduit_parse_confirm(const uint8_t *buf, size_t len,
                                      conduit_handshake_confirm *out);
 
+/* ============================================================================
+ * Keep-alive (heartbeat) and RTT
+ *
+ * Once a connection is established, an endpoint probes liveness and measures
+ * round-trip time with HEARTBEAT / HEARTBEAT_ACK. Both carry a 4-byte Sequence.
+ * The prober chooses a fresh Sequence and records the send time; the peer echoes
+ * the same Sequence in a HEARTBEAT_ACK without keeping any state; when the ack
+ * returns, the prober computes RTT = now - send_time on its own clock. The
+ * Sequence is an opaque label only -- no clock value crosses the wire.
+ * ========================================================================== */
+
+/* HEARTBEAT and HEARTBEAT_ACK have identical bodies and sizes. */
+#define CONDUIT_HEARTBEAT_SIZE (CONDUIT_HEADER_SIZE + 4) /* + sequence(4) */
+
+/* Parsed heartbeat body (used for both HEARTBEAT and HEARTBEAT_ACK). */
+typedef struct { uint32_t sequence; } conduit_heartbeat;
+
+/* Builders: write a complete packet addressed to `dest_cid` into `buf`
+ * (capacity `cap`). Return bytes written, or 0 if `cap` is too small. */
+size_t conduit_build_heartbeat(uint32_t dest_cid, uint32_t sequence,
+                               uint8_t *buf, size_t cap);
+size_t conduit_build_heartbeat_ack(uint32_t dest_cid, uint32_t sequence,
+                                   uint8_t *buf, size_t cap);
+
+/* Parser: read the Sequence from a HEARTBEAT or HEARTBEAT_ACK whose fixed header
+ * has already been validated by conduit_header_decode(). */
+conduit_result conduit_parse_heartbeat(const uint8_t *buf, size_t len,
+                                       conduit_heartbeat *out);
+
 #endif /* CONDUIT_H */

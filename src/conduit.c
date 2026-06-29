@@ -138,3 +138,35 @@ conduit_result conduit_parse_confirm(const uint8_t *buf, size_t len,
     out->token = get_u32(buf + CONDUIT_HEADER_SIZE + 0);
     return CONDUIT_OK;
 }
+
+/* ============================================================================
+ * Heartbeat builders and parser
+ * ========================================================================== */
+
+/* HEARTBEAT and HEARTBEAT_ACK differ only by packet type, so they share one
+ * internal builder. */
+static size_t build_heartbeat_typed(uint8_t type, uint32_t dest_cid,
+                                     uint32_t sequence, uint8_t *buf, size_t cap) {
+    if (cap < CONDUIT_HEARTBEAT_SIZE) return 0;
+    conduit_header h = { dest_cid, type, 0 };
+    conduit_header_encode(&h, buf);
+    put_u32(buf + CONDUIT_HEADER_SIZE + 0, sequence);
+    return CONDUIT_HEARTBEAT_SIZE;
+}
+
+size_t conduit_build_heartbeat(uint32_t dest_cid, uint32_t sequence,
+                               uint8_t *buf, size_t cap) {
+    return build_heartbeat_typed(CONDUIT_PKT_HEARTBEAT, dest_cid, sequence, buf, cap);
+}
+
+size_t conduit_build_heartbeat_ack(uint32_t dest_cid, uint32_t sequence,
+                                   uint8_t *buf, size_t cap) {
+    return build_heartbeat_typed(CONDUIT_PKT_HEARTBEAT_ACK, dest_cid, sequence, buf, cap);
+}
+
+conduit_result conduit_parse_heartbeat(const uint8_t *buf, size_t len,
+                                       conduit_heartbeat *out) {
+    if (len < CONDUIT_HEARTBEAT_SIZE) return CONDUIT_ERR_TOO_SHORT;
+    out->sequence = get_u32(buf + CONDUIT_HEADER_SIZE + 0);
+    return CONDUIT_OK;
+}

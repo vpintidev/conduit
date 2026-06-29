@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Conduit is a connection-oriented communication protocol layered on top of UDP, plus its reference implementation in C. The project is early: the specification ([docs/conduit-spec.md](docs/conduit-spec.md)) is `draft-conduit-00`. Specified and implemented so far: Section 2 (Packet Format) — the fixed 7-octet header (Connection ID, Type, Flags) with the critical/ignorable flag partition — and Section 3.1 (the three-message INIT/RESP/CONFIRM handshake, with connection-ID assignment and an address-validation token). Sections 3.2–3.3 (keep-alive, RTT, termination) and 4–5 (reliability, channels) are still placeholders.
+Conduit is a connection-oriented communication protocol layered on top of UDP, plus its reference implementation in C. The project is early: the specification ([docs/conduit-spec.md](docs/conduit-spec.md)) is `draft-conduit-00`. Specified and implemented so far: Section 2 (Packet Format) — the fixed 7-octet header (Connection ID, Type, Flags) with the critical/ignorable flag partition — Section 3.1 (the three-message INIT/RESP/CONFIRM handshake, with connection-ID assignment and an address-validation token), and Section 3.2 (HEARTBEAT/HEARTBEAT_ACK keep-alive with a 4-octet Sequence for sender-clock RTT). Section 3.3 (termination) and Sections 4–5 (reliability, channels) are still placeholders.
 
 The spec and the implementation evolve together. [docs/conduit-spec.md](docs/conduit-spec.md) is the source of truth — read it before writing protocol code, and update it in the same change when wire format or protocol behavior changes. Sections describing not-yet-implemented features are explicitly marked "*To be specified*"; keep that marking accurate.
 
@@ -13,8 +13,9 @@ The spec and the implementation evolve together. [docs/conduit-spec.md](docs/con
 ```
 docs/conduit-spec.md       # the specification (the "RFC") — source of truth
 src/conduit.h              # public API
-src/conduit.c              # reference implementation (header + handshake codec)
-tests/test_conduit.c       # dependency-free test harness
+src/conduit.c              # reference implementation (header + handshake + heartbeat codec)
+tests/test.h               # tiny zero-dependency test framework (TEST/CHECK macros)
+tests/test_conduit.c       # the test suite, built on test.h
 examples/udp_hello.c       # throwaway POSIX UDP spike — NOT part of the framework
 examples/conduit_ping.c    # sends/receives a real Conduit header over UDP
 examples/conduit_handshake.c # demonstrates the INIT/RESP/CONFIRM handshake
@@ -35,7 +36,7 @@ make handshake # build the conduit_handshake example
 make clean     # remove build/
 ```
 
-The test harness is a single `main()` in [tests/test_conduit.c](tests/test_conduit.c) that builds each case, prints a line, and ANDs per-case booleans into a final pass/fail; it returns non-zero on any failure, so `make test` drops into CI as-is. Add a case by following the same pattern and folding its boolean into `all_ok`.
+Tests use the tiny framework in [tests/test.h](tests/test.h): start a case with `TEST("name")`, assert with `CHECK(...)` / `CHECK_EQ_U32(...)` / `CHECK_EQ_SIZE(...)`, and end `main()` with `return test_summary();`. Nothing aborts on failure — one run reports every failing case with `file:line` — and `test_summary()` returns non-zero if any failed, so `make test` drops into CI as-is. Add a case by calling `TEST(...)` then its checks. CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs `make all test` under both gcc and clang plus an ASan+UBSan build; `make` honors `CC` and `EXTRA_CFLAGS`.
 
 Run the handshake demo end-to-end (loopback, no loss assumed):
 
