@@ -9,13 +9,14 @@
 #include "conduit.h"
 #include "test.h"
 
-int main(void) {
+int main(void)
+{
     uint8_t buf[64];
     conduit_header h;
 
     /* ---- fixed header ---- */
     TEST("fixed header round-trip");
-    conduit_header src = { 0xABCD1234u, CONDUIT_PKT_DATA, 0 };
+    conduit_header src = {0xABCD1234u, CONDUIT_PKT_DATA, 0};
     size_t n = conduit_header_encode(&src, buf);
     CHECK_EQ_SIZE(n, CONDUIT_HEADER_SIZE);
     CHECK(conduit_header_decode(buf, n, &h) == CONDUIT_OK);
@@ -28,7 +29,7 @@ int main(void) {
 
     TEST("reject unknown critical flag");
     /* A critical flag bit (high byte) undefined in this revision must be rejected. */
-    conduit_header crit = { 1u, CONDUIT_PKT_DATA, 0x0100u };
+    conduit_header crit = {1u, CONDUIT_PKT_DATA, 0x0100u};
     conduit_header_encode(&crit, buf);
     CHECK(conduit_header_decode(buf, CONDUIT_HEADER_SIZE, &h) == CONDUIT_ERR_UNKNOWN_CRITICAL);
 
@@ -49,7 +50,7 @@ int main(void) {
     CHECK_EQ_SIZE(rs_len, CONDUIT_RESP_SIZE);
     CHECK(conduit_header_decode(buf, rs_len, &h) == CONDUIT_OK);
     CHECK(h.type == CONDUIT_PKT_HANDSHAKE_RESP);
-    CHECK_EQ_U32(h.connection_id, 0x11111111u);   /* addressed to initiator */
+    CHECK_EQ_U32(h.connection_id, 0x11111111u); /* addressed to initiator */
     conduit_handshake_resp hr;
     CHECK(conduit_parse_resp(buf, rs_len, &hr) == CONDUIT_OK);
     CHECK_EQ_U32(hr.responder_cid, 0x22222222u);
@@ -60,7 +61,7 @@ int main(void) {
     CHECK_EQ_SIZE(cf_len, CONDUIT_CONFIRM_SIZE);
     CHECK(conduit_header_decode(buf, cf_len, &h) == CONDUIT_OK);
     CHECK(h.type == CONDUIT_PKT_HANDSHAKE_CONFIRM);
-    CHECK_EQ_U32(h.connection_id, 0x22222222u);   /* addressed to responder */
+    CHECK_EQ_U32(h.connection_id, 0x22222222u); /* addressed to responder */
     conduit_handshake_confirm hc;
     CHECK(conduit_parse_confirm(buf, cf_len, &hc) == CONDUIT_OK);
     CHECK_EQ_U32(hc.token, 0xDEADBEEFu);
@@ -92,6 +93,37 @@ int main(void) {
     TEST("reject truncated heartbeat body");
     conduit_heartbeat hb2;
     CHECK(conduit_parse_heartbeat(buf, CONDUIT_HEADER_SIZE + 1, &hb2) == CONDUIT_ERR_TOO_SHORT);
+
+    /* ---- liveness / RTT (deterministic, simulated clock) ---- */
+    TEST("liveness: heartbeat fires only after the idle interval");
+    conduit_conn c;
+    conduit_conn_init(&c, 0x0000BBBBu, 1000u /*interval*/, 3u /*timeout*/);
+    CHECK_EQ_SIZE(conduit_conn_tick(&c, 0, buf, sizeof(buf)), 0u);   /* not yet */
+    CHECK_EQ_SIZE(conduit_conn_tick(&c, 999, buf, sizeof(buf)), 0u); /* not yet */
+    size_t hn = conduit_conn_tick(&c, 1000, buf, sizeof(buf));       /* now! */
+    CHECK_EQ_SIZE(hn, CONDUIT_HEARTBEAT_SIZE);
+    CHECK(conduit_header_decode(buf, hn, &h) == CONDUIT_OK);
+    CHECK(h.type == CONDUIT_PKT_HEARTBEAT);
+    conduit_heartbeat probe;
+    CHECK(conduit_parse_heartbeat(buf, hn, &probe) == CONDUIT_OK);
+    CHECK_EQ_U32(probe.sequence, 1u);
+
+    TEST("liveness: matching ack yields RTT and keeps the connection alive");
+    conduit_conn_on_ack(&c, probe.sequence, 1200u); /* ack 200 ms later */
+    uint32_t rtt = 0;
+    CHECK(conduit_conn_rtt_ms(&c, &rtt) == 1);
+    CHECK_EQ_U32(rtt, 200u);
+    CHECK(conduit_conn_status(&c) == CONDUIT_CONN_ALIVE);
+
+    TEST("liveness: connection declared lost after unacked probes");
+    conduit_conn c2;
+    conduit_conn_init(&c2, 0x0000BBBBu, 1000u, 3u);
+    conduit_conn_tick(&c2, 1000, buf, sizeof(buf)); /* probe 1 */
+    conduit_conn_tick(&c2, 2000, buf, sizeof(buf)); /* probe 2 */
+    conduit_conn_tick(&c2, 3000, buf, sizeof(buf)); /* probe 3 */
+    CHECK(conduit_conn_status(&c2) == CONDUIT_CONN_ALIVE);
+    CHECK_EQ_SIZE(conduit_conn_tick(&c2, 4000, buf, sizeof(buf)), 0u); /* #4 -> lost */
+    CHECK(conduit_conn_status(&c2) == CONDUIT_CONN_LOST);
 
     return test_summary();
 }

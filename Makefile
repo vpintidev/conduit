@@ -17,10 +17,11 @@ TEST_BIN    := $(BUILD)/test_conduit
 EXAMPLE_BIN := $(BUILD)/udp_hello
 PING_BIN    := $(BUILD)/conduit_ping
 HS_BIN      := $(BUILD)/conduit_handshake
+RTT_BIN     := $(BUILD)/conduit_rtt
 
-.PHONY: all test example ping handshake clean
+.PHONY: all test example ping handshake rtt clean
 
-all: $(TEST_BIN) $(EXAMPLE_BIN) $(PING_BIN) $(HS_BIN)
+all: $(TEST_BIN) $(EXAMPLE_BIN) $(PING_BIN) $(HS_BIN) $(RTT_BIN)
 
 # Compile the library object once; the test links against it.
 $(LIB_OBJ): $(LIB_SRC) src/conduit.h | $(BUILD)
@@ -52,6 +53,12 @@ $(HS_BIN): examples/conduit_handshake.c $(LIB_OBJ) | $(BUILD)
 	$(CC) $(CFLAGS) $< $(LIB_OBJ) -o $@
 
 handshake: $(HS_BIN)
+
+# conduit_rtt keeps a connection alive (heartbeats, RTT, timeout); links the library.
+$(RTT_BIN): examples/conduit_rtt.c $(LIB_OBJ) | $(BUILD)
+	$(CC) $(CFLAGS) $< $(LIB_OBJ) -o $@
+
+rtt: $(RTT_BIN)
 
 $(BUILD):
 	mkdir -p $(BUILD)

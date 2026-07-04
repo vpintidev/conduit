@@ -19,14 +19,15 @@
  * The detailed exchange semantics of each type are defined in later sections
  * of the specification; here we only fix their on-the-wire values so they are
  * stable from the start. */
-typedef enum {
-    CONDUIT_PKT_HANDSHAKE_INIT    = 0x01, /* initiator -> responder: announce    */
-    CONDUIT_PKT_HANDSHAKE_RESP    = 0x02, /* responder -> initiator: CID + token  */
+typedef enum
+{
+    CONDUIT_PKT_HANDSHAKE_INIT = 0x01,    /* initiator -> responder: announce    */
+    CONDUIT_PKT_HANDSHAKE_RESP = 0x02,    /* responder -> initiator: CID + token  */
     CONDUIT_PKT_HANDSHAKE_CONFIRM = 0x03, /* initiator -> responder: echo token   */
-    CONDUIT_PKT_DATA              = 0x10, /* application payload                  */
-    CONDUIT_PKT_HEARTBEAT         = 0x20, /* liveness probe (also drives RTT)     */
-    CONDUIT_PKT_HEARTBEAT_ACK     = 0x21, /* reply to a heartbeat                 */
-    CONDUIT_PKT_CLOSE             = 0x30  /* best-effort connection close         */
+    CONDUIT_PKT_DATA = 0x10,              /* application payload                  */
+    CONDUIT_PKT_HEARTBEAT = 0x20,         /* liveness probe (also drives RTT)     */
+    CONDUIT_PKT_HEARTBEAT_ACK = 0x21,     /* reply to a heartbeat                 */
+    CONDUIT_PKT_CLOSE = 0x30              /* best-effort connection close         */
 } conduit_packet_type;
 
 /* ---- Flags (the 16-bit 'flags' field) ------------------------------------
@@ -38,24 +39,26 @@ typedef enum {
  * No flag bits are defined in circle 1 (the field is always 0). The masks below
  * let the decoder enforce the rule already; named bits will be added later
  * without ever moving these class boundaries. */
-#define CONDUIT_FLAG_CRITICAL_MASK  0xFF00u
+#define CONDUIT_FLAG_CRITICAL_MASK 0xFF00u
 #define CONDUIT_FLAG_IGNORABLE_MASK 0x00FFu
 
 /* ---- In-memory representation of the fixed header ------------------------
  * IMPORTANT: this struct is the *in-memory* view, NOT the wire layout. Never
  * send a struct over the network directly: padding and byte order differ
  * between machines. Use conduit_header_encode() / conduit_header_decode(). */
-typedef struct {
+typedef struct
+{
     uint32_t connection_id; /* destination's connection ID (the demux key) */
-    uint8_t  type;          /* one of conduit_packet_type                  */
+    uint8_t type;           /* one of conduit_packet_type                  */
     uint16_t flags;         /* see CONDUIT_FLAG_* above                     */
 } conduit_header;
 
 /* ---- Result codes for decoding ------------------------------------------- */
-typedef enum {
+typedef enum
+{
     CONDUIT_OK = 0,
-    CONDUIT_ERR_TOO_SHORT,        /* buffer smaller than the fixed header   */
-    CONDUIT_ERR_UNKNOWN_CRITICAL  /* an unknown CRITICAL flag bit was set   */
+    CONDUIT_ERR_TOO_SHORT,       /* buffer smaller than the fixed header   */
+    CONDUIT_ERR_UNKNOWN_CRITICAL /* an unknown CRITICAL flag bit was set   */
 } conduit_result;
 
 /* ---- Encode / decode ----------------------------------------------------- */
@@ -101,14 +104,26 @@ const char *conduit_packet_type_name(uint8_t type);
 #define CONDUIT_CID_UNSPECIFIED 0u
 
 /* Total packet sizes for each handshake message (fixed header + body). */
-#define CONDUIT_INIT_SIZE    (CONDUIT_HEADER_SIZE + 5) /* +version(1)+cid(4)         */
-#define CONDUIT_RESP_SIZE    (CONDUIT_HEADER_SIZE + 9) /* +version(1)+cid(4)+token(4)*/
+#define CONDUIT_INIT_SIZE (CONDUIT_HEADER_SIZE + 5)    /* +version(1)+cid(4)         */
+#define CONDUIT_RESP_SIZE (CONDUIT_HEADER_SIZE + 9)    /* +version(1)+cid(4)+token(4)*/
 #define CONDUIT_CONFIRM_SIZE (CONDUIT_HEADER_SIZE + 4) /* +token(4)                  */
 
 /* Parsed handshake bodies. */
-typedef struct { uint8_t  version; uint32_t initiator_cid; } conduit_handshake_init;
-typedef struct { uint8_t  version; uint32_t responder_cid; uint32_t token; } conduit_handshake_resp;
-typedef struct { uint32_t token; } conduit_handshake_confirm;
+typedef struct
+{
+    uint8_t version;
+    uint32_t initiator_cid;
+} conduit_handshake_init;
+typedef struct
+{
+    uint8_t version;
+    uint32_t responder_cid;
+    uint32_t token;
+} conduit_handshake_resp;
+typedef struct
+{
+    uint32_t token;
+} conduit_handshake_confirm;
 
 /* Builders: write a complete handshake packet into `buf` (capacity `cap`).
  * Return the number of bytes written, or 0 if `cap` is too small. */
@@ -142,7 +157,10 @@ conduit_result conduit_parse_confirm(const uint8_t *buf, size_t len,
 #define CONDUIT_HEARTBEAT_SIZE (CONDUIT_HEADER_SIZE + 4) /* + sequence(4) */
 
 /* Parsed heartbeat body (used for both HEARTBEAT and HEARTBEAT_ACK). */
-typedef struct { uint32_t sequence; } conduit_heartbeat;
+typedef struct
+{
+    uint32_t sequence;
+} conduit_heartbeat;
 
 /* Builders: write a complete packet addressed to `dest_cid` into `buf`
  * (capacity `cap`). Return bytes written, or 0 if `cap` is too small. */
@@ -155,5 +173,65 @@ size_t conduit_build_heartbeat_ack(uint32_t dest_cid, uint32_t sequence,
  * has already been validated by conduit_header_decode(). */
 conduit_result conduit_parse_heartbeat(const uint8_t *buf, size_t len,
                                        conduit_heartbeat *out);
+
+/* ============================================================================
+ * Connection liveness and RTT (established connections)
+ *
+ * Minimal, time-injected state for keeping an established connection alive and
+ * measuring RTT. It is NOT yet the full connection object / state machine; it
+ * manages only heartbeat scheduling, RTT, and liveness-failure detection.
+ *
+ * Time is supplied by the caller as a monotonic millisecond count and is never
+ * read inside these functions, so the logic is fully deterministic and can be
+ * unit-tested with a simulated clock.
+ * ========================================================================== */
+
+typedef enum
+{
+    CONDUIT_CONN_ALIVE = 0,
+    CONDUIT_CONN_LOST = 1
+} conduit_conn_state;
+
+typedef struct
+{
+    uint32_t peer_cid;      /* destination CID for packets we send        */
+    uint32_t interval_ms;   /* idle time before a heartbeat is sent       */
+    uint32_t timeout_count; /* unacked probes that declare the peer lost  */
+
+    conduit_conn_state state;
+    uint32_t next_seq;     /* sequence for the next heartbeat            */
+    uint64_t last_send_ms; /* when we last sent a heartbeat              */
+    uint32_t inflight;     /* heartbeats sent since the last sign of life*/
+
+    int has_pending;           /* is a probe outstanding (for RTT)?          */
+    uint32_t pending_seq;      /* its sequence                               */
+    uint64_t pending_since_ms; /* when it was sent                           */
+
+    int has_rtt;
+    uint32_t last_rtt_ms; /* most recent measured RTT                   */
+} conduit_conn;
+
+/* Initialize liveness state for an established connection. */
+void conduit_conn_init(conduit_conn *c, uint32_t peer_cid,
+                       uint32_t interval_ms, uint32_t timeout_count);
+
+/* Advance time to `now_ms`. If idle for `interval_ms`, write a HEARTBEAT into
+ * `out` (capacity `cap`) and return its length; otherwise return 0. May move the
+ * connection to CONDUIT_CONN_LOST after too many unacked probes. */
+size_t conduit_conn_tick(conduit_conn *c, uint64_t now_ms, uint8_t *out, size_t cap);
+
+/* Record a HEARTBEAT_ACK for `acked_seq` at `now_ms`: clears the unacked count
+ * and, if it matches the outstanding probe, updates the measured RTT. Ignored if
+ * the connection is already lost. */
+void conduit_conn_on_ack(conduit_conn *c, uint32_t acked_seq, uint64_t now_ms);
+
+/* Record that some packet from the peer arrived (any packet is a sign of life). */
+void conduit_conn_note_recv(conduit_conn *c);
+
+/* Current liveness state. */
+conduit_conn_state conduit_conn_status(const conduit_conn *c);
+
+/* If an RTT has been measured, store it in `*out_rtt_ms` and return 1; else 0. */
+int conduit_conn_rtt_ms(const conduit_conn *c, uint32_t *out_rtt_ms);
 
 #endif /* CONDUIT_H */
