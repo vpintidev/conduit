@@ -1,9 +1,12 @@
 // conduit_rtt.c — Keep an (assumed-established) connection alive over UDP:
 // heartbeats, RTT measurement, and timeout-based death detection.
 //
-// Two symmetric peers on fixed loopback ports. Run both, watch RTT; kill one
-// (Ctrl-C) and the other declares the connection LOST after a few unanswered
-// probes. Observe on the wire with:
+// Two symmetric peers on fixed loopback ports. Run both, watch RTT. Then:
+//   - Ctrl-C one peer: it sends a best-effort CLOSE, and the other prints
+//     "<- CLOSE ... connection CLOSED" at once (no waiting for a timeout).
+//   - Or kill -9 one peer (no CLOSE sent): the other falls back to declaring
+//     the connection LOST after a few unanswered probes.
+// Observe on the wire with:
 //   sudo tcpdump -i lo -X udp port 9000 or udp port 9001
 //
 // Build:  make rtt
@@ -14,7 +17,8 @@
 // real app they come from the handshake. This demo isolates liveness. It also
 // counts only heartbeat sends as "activity" for the idle timer; a fuller
 // implementation resets the timer on any packet sent and skips heartbeats while
-// application data flows (see spec section 3.2).
+// application data flows (see spec section 3.2). The CLOSE is best-effort: it is
+// not acked or retransmitted (spec section 3.3).
 
 #include "conduit.h"
 
@@ -24,10 +28,21 @@
 #include <errno.h>
 #include <time.h>
 #include <sys/time.h>
+#include <signal.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+
+/* Set from the SIGINT handler so the main loop can exit cleanly and send a
+ * CLOSE on the way out. volatile sig_atomic_t is the only thing it is safe to
+ * touch from a signal handler. */
+static volatile sig_atomic_t g_stop = 0;
+static void on_sigint(int signo)
+{
+    (void)signo;
+    g_stop = 1;
+}
 
 static uint64_t now_ms(void)
 {
@@ -70,6 +85,9 @@ static int run_peer(const char *name, int my_port, int peer_port,
     struct timeval tv = {0, 100000};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
+    /* Catch Ctrl-C so we can send a CLOSE before exiting instead of vanishing. */
+    signal(SIGINT, on_sigint);
+
     conduit_conn c;
     conduit_conn_init(&c, peer_cid, 1000u /*heartbeat ~1s*/, 3u /*lost after 3 unacked*/);
     printf("[%s] up on port %d, talking to %d\n", name, my_port, peer_port);
@@ -82,7 +100,12 @@ static int run_peer(const char *name, int my_port, int peer_port,
 
         if (n < 0)
         {
-            if (errno != EAGAIN && errno != EWOULDBLOCK)
+            if (errno == EINTR)
+            {
+                /* Interrupted by SIGINT: fall through so the g_stop check below
+                 * can exit the loop cleanly. Not an error. */
+            }
+            else if (errno != EAGAIN && errno != EWOULDBLOCK)
             {
                 perror("recvfrom");
                 break;
@@ -118,6 +141,17 @@ static int run_peer(const char *name, int my_port, int peer_port,
                                    name, (unsigned)echoed.sequence, (unsigned)rtt);
                     }
                 }
+                else if (h.type == CONDUIT_PKT_CLOSE)
+                {
+                    conduit_close cl;
+                    if (conduit_parse_close(buf, (size_t)n, &cl) == CONDUIT_OK)
+                    {
+                        conduit_conn_close(&c);
+                        printf("[%s] <- CLOSE (reason=%s) -> connection CLOSED\n",
+                               name, conduit_close_reason_name(cl.reason));
+                        break; /* peer is gone by its own choice; stop */
+                    }
+                }
             }
         }
 
@@ -133,6 +167,30 @@ static int run_peer(const char *name, int my_port, int peer_port,
             printf("[%s] peer unresponsive -> connection LOST\n", name);
             break;
         }
+
+        /* Ctrl-C: leave the loop so we can close the connection gracefully. */
+        if (g_stop)
+        {
+            printf("\n[%s] interrupted -> closing connection\n", name);
+            break;
+        }
+    }
+
+    /* If we are still ALIVE on the way out (i.e. the user interrupted us rather
+     * than the peer vanishing or closing first), tell the peer with a best-effort
+     * CLOSE. It is not acked or retransmitted: if it is lost, the peer falls back
+     * to its keep-alive timeout. */
+    if (conduit_conn_status(&c) == CONDUIT_CONN_ALIVE)
+    {
+        uint8_t out[64];
+        size_t cn = conduit_build_close(peer_cid, CONDUIT_CLOSE_SHUTDOWN,
+                                        out, sizeof(out));
+        if (cn > 0)
+        {
+            sendto(fd, out, cn, 0, (struct sockaddr *)&dst, sizeof(dst));
+            printf("[%s] -> CLOSE (reason=SHUTDOWN)\n", name);
+        }
+        conduit_conn_close(&c);
     }
 
     close(fd);

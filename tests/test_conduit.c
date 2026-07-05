@@ -174,5 +174,121 @@ int main(void)
     conduit_conn_close(&c4);
     CHECK(conduit_conn_status(&c4) == CONDUIT_CONN_LOST);
 
+    /* ---- handshake driver (deterministic, simulated clock) ---- */
+    TEST("handshake: full INIT/RESP/CONFIRM drives both sides to ESTABLISHED");
+    {
+        conduit_handshake_state ini, res;
+        conduit_handshake_init_initiator(&ini, 0x0000AAAAu, 1000u, 4000u, 4u);
+        conduit_handshake_init_responder(&res, 0x0000BBBBu);
+
+        uint8_t initpkt[64], resppkt[64], confpkt[64];
+        conduit_header hh;
+
+        /* initiator's first tick emits INIT immediately */
+        size_t ni = conduit_handshake_tick(&ini, 0, initpkt, sizeof(initpkt));
+        CHECK_EQ_SIZE(ni, CONDUIT_INIT_SIZE);
+        CHECK(conduit_header_decode(initpkt, ni, &hh) == CONDUIT_OK);
+        CHECK(hh.type == CONDUIT_PKT_HANDSHAKE_INIT);
+
+        /* responder consumes INIT, emits RESP (token is caller-supplied) */
+        size_t nr = conduit_handshake_on_init(&res, initpkt, ni, 0xDEADBEEFu,
+                                              resppkt, sizeof(resppkt));
+        CHECK_EQ_SIZE(nr, CONDUIT_RESP_SIZE);
+        CHECK(conduit_handshake_status(&res) == CONDUIT_HS_RESP_SENT);
+        CHECK(conduit_header_decode(resppkt, nr, &hh) == CONDUIT_OK);
+        CHECK(hh.type == CONDUIT_PKT_HANDSHAKE_RESP);
+        CHECK_EQ_U32(hh.connection_id, 0x0000AAAAu); /* addressed to initiator */
+
+        /* initiator consumes RESP, emits CONFIRM, is ESTABLISHED */
+        size_t nc = conduit_handshake_on_resp(&ini, resppkt, nr,
+                                              confpkt, sizeof(confpkt));
+        CHECK_EQ_SIZE(nc, CONDUIT_CONFIRM_SIZE);
+        CHECK(conduit_handshake_status(&ini) == CONDUIT_HS_ESTABLISHED);
+        CHECK_EQ_U32(conduit_handshake_peer_cid(&ini), 0x0000BBBBu);
+        CHECK(conduit_header_decode(confpkt, nc, &hh) == CONDUIT_OK);
+        CHECK(hh.type == CONDUIT_PKT_HANDSHAKE_CONFIRM);
+        CHECK_EQ_U32(hh.connection_id, 0x0000BBBBu); /* addressed to responder */
+
+        /* responder consumes CONFIRM, token matches, is ESTABLISHED */
+        CHECK(conduit_handshake_on_confirm(&res, confpkt, nc) == 1);
+        CHECK(conduit_handshake_status(&res) == CONDUIT_HS_ESTABLISHED);
+        CHECK_EQ_U32(conduit_handshake_peer_cid(&res), 0x0000AAAAu);
+    }
+
+    TEST("handshake: INIT retransmits on exponential backoff (1s, +2s, +4s capped)");
+    {
+        conduit_handshake_state ini;
+        conduit_handshake_init_initiator(&ini, 0x0000AAAAu, 1000u, 4000u, 4u);
+        uint8_t p[64];
+        /* Sends at t=0, then when backoff elapses: 1000, 3000, 7000. Between
+         * those instants, tick emits nothing. */
+        CHECK_EQ_SIZE(conduit_handshake_tick(&ini, 0, p, sizeof(p)), CONDUIT_INIT_SIZE);
+        CHECK_EQ_SIZE(conduit_handshake_tick(&ini, 999, p, sizeof(p)), 0u);
+        CHECK_EQ_SIZE(conduit_handshake_tick(&ini, 1000, p, sizeof(p)), CONDUIT_INIT_SIZE);
+        CHECK_EQ_SIZE(conduit_handshake_tick(&ini, 2999, p, sizeof(p)), 0u);
+        CHECK_EQ_SIZE(conduit_handshake_tick(&ini, 3000, p, sizeof(p)), CONDUIT_INIT_SIZE);
+        CHECK_EQ_SIZE(conduit_handshake_tick(&ini, 6999, p, sizeof(p)), 0u);
+        CHECK_EQ_SIZE(conduit_handshake_tick(&ini, 7000, p, sizeof(p)), CONDUIT_INIT_SIZE);
+        CHECK(conduit_handshake_status(&ini) == CONDUIT_HS_INIT_SENT);
+    }
+
+    TEST("handshake: initiator FAILS after max unanswered INITs");
+    {
+        conduit_handshake_state ini;
+        conduit_handshake_init_initiator(&ini, 0x0000AAAAu, 1000u, 4000u, 4u);
+        uint8_t p[64];
+        conduit_handshake_tick(&ini, 0, p, sizeof(p));    /* INIT #1 */
+        conduit_handshake_tick(&ini, 1000, p, sizeof(p)); /* INIT #2 */
+        conduit_handshake_tick(&ini, 3000, p, sizeof(p)); /* INIT #3 */
+        conduit_handshake_tick(&ini, 7000, p, sizeof(p)); /* INIT #4 */
+        CHECK(conduit_handshake_status(&ini) == CONDUIT_HS_INIT_SENT);
+        /* attempts now == max_attempts: next tick gives up */
+        CHECK_EQ_SIZE(conduit_handshake_tick(&ini, 20000, p, sizeof(p)), 0u);
+        CHECK(conduit_handshake_status(&ini) == CONDUIT_HS_FAILED);
+    }
+
+    TEST("handshake: a repeat INIT re-issues RESP (recovers a lost RESP)");
+    {
+        conduit_handshake_state res;
+        conduit_handshake_init_responder(&res, 0x0000BBBBu);
+        uint8_t initpkt[64], resppkt[64];
+        size_t ni = conduit_build_init(0x0000AAAAu, initpkt, sizeof(initpkt));
+
+        /* first INIT -> RESP */
+        size_t nr1 = conduit_handshake_on_init(&res, initpkt, ni, 0x11111111u,
+                                               resppkt, sizeof(resppkt));
+        CHECK_EQ_SIZE(nr1, CONDUIT_RESP_SIZE);
+        CHECK(conduit_handshake_status(&res) == CONDUIT_HS_RESP_SENT);
+
+        /* the RESP was "lost"; the initiator re-sends INIT. The responder,
+         * already in RESP_SENT, must emit a fresh RESP rather than ignore it. */
+        size_t nr2 = conduit_handshake_on_init(&res, initpkt, ni, 0x22222222u,
+                                               resppkt, sizeof(resppkt));
+        CHECK_EQ_SIZE(nr2, CONDUIT_RESP_SIZE);
+        CHECK(conduit_handshake_status(&res) == CONDUIT_HS_RESP_SENT);
+    }
+
+    TEST("handshake: CONFIRM with the wrong token is rejected");
+    {
+        conduit_handshake_state res;
+        conduit_handshake_init_responder(&res, 0x0000BBBBu);
+        uint8_t initpkt[64], resppkt[64], confpkt[64];
+        size_t ni = conduit_build_init(0x0000AAAAu, initpkt, sizeof(initpkt));
+        conduit_handshake_on_init(&res, initpkt, ni, 0xABCDABCDu,
+                                  resppkt, sizeof(resppkt));
+
+        /* CONFIRM echoing the WRONG token must be refused; state stays RESP_SENT. */
+        size_t nbad = conduit_build_confirm(0x0000BBBBu, 0x00000000u,
+                                            confpkt, sizeof(confpkt));
+        CHECK(conduit_handshake_on_confirm(&res, confpkt, nbad) == 0);
+        CHECK(conduit_handshake_status(&res) == CONDUIT_HS_RESP_SENT);
+
+        /* the correct token is accepted */
+        size_t ngood = conduit_build_confirm(0x0000BBBBu, 0xABCDABCDu,
+                                             confpkt, sizeof(confpkt));
+        CHECK(conduit_handshake_on_confirm(&res, confpkt, ngood) == 1);
+        CHECK(conduit_handshake_status(&res) == CONDUIT_HS_ESTABLISHED);
+    }
+
     return test_summary();
 }

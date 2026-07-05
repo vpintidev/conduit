@@ -194,9 +194,9 @@ conduit_result conduit_parse_heartbeat(const uint8_t *buf, size_t len,
  * the list may grow without a wire change. */
 typedef enum
 {
-    CONDUIT_CLOSE_NONE = 0x00,        /* unspecified / graceful, no detail       */
-    CONDUIT_CLOSE_APPLICATION = 0x01, /* the application asked to close          */
-    CONDUIT_CLOSE_SHUTDOWN = 0x02,    /* endpoint is shutting down / going away  */
+    CONDUIT_CLOSE_NONE = 0x00,          /* unspecified / graceful, no detail       */
+    CONDUIT_CLOSE_APPLICATION = 0x01,   /* the application asked to close          */
+    CONDUIT_CLOSE_SHUTDOWN = 0x02,      /* endpoint is shutting down / going away  */
     CONDUIT_CLOSE_PROTOCOL_ERROR = 0x03 /* peer violated the protocol            */
 } conduit_close_reason;
 
@@ -289,5 +289,127 @@ conduit_conn_state conduit_conn_status(const conduit_conn *c);
 
 /* If an RTT has been measured, store it in `*out_rtt_ms` and return 1; else 0. */
 int conduit_conn_rtt_ms(const conduit_conn *c, uint32_t *out_rtt_ms);
+
+/* ============================================================================
+ * Handshake driver with retransmission
+ *
+ * The handshake (Section 3.1) runs over connectionless UDP and cannot lean on
+ * the (not-yet-established) reliability layer, so it must be robust to loss on
+ * its own. This driver adds that robustness on top of the stateless builders and
+ * parsers above. Like conduit_conn, it is time-injected: the caller supplies a
+ * monotonic millisecond clock via _tick(), the driver never reads the clock
+ * itself, and the whole thing is unit-testable with a simulated clock.
+ *
+ * Only ONE retransmission timer exists in the whole handshake, on the INITIATOR,
+ * and only for INIT:
+ *
+ *   - The initiator sends INIT and waits for RESP. If RESP does not arrive
+ *     before the current backoff elapses, it re-sends INIT (exponential backoff,
+ *     capped, up to a maximum number of attempts, after which the handshake
+ *     FAILS). On RESP it sends CONFIRM once and is ESTABLISHED.
+ *
+ *   - Re-sending INIT also recovers a lost RESP: a responder that sees a repeat
+ *     INIT simply issues a fresh RESP. The responder therefore keeps NO timer.
+ *
+ *   - A lost CONFIRM is NOT retransmitted. The initiator considers itself
+ *     ESTABLISHED once CONFIRM is sent and moves on to heartbeats. If that
+ *     CONFIRM was lost, the responder never reaches ESTABLISHED, ignores the
+ *     initiator's later traffic, and the initiator's own keep-alive timeout
+ *     (Section 3.2) eventually declares the half-open connection dead so it can
+ *     restart. This is "local truth" (Section 1.4): the liveness mechanism we
+ *     already have repairs the half-open state -- no extra machinery here.
+ *
+ * The responder is deliberately stateless with respect to timers: it reacts to
+ * INIT by emitting RESP and validates the echoed token in CONFIRM. It uses this
+ * driver only to track the logical phase (LISTEN -> ESTABLISHED), not to
+ * schedule retransmissions.
+ * ========================================================================== */
+
+/* Which side of the handshake this driver plays. */
+typedef enum
+{
+    CONDUIT_ROLE_INITIATOR = 0,
+    CONDUIT_ROLE_RESPONDER = 1
+} conduit_role;
+
+/* Handshake phase. FAILED is terminal (initiator gave up after too many INITs). */
+typedef enum
+{
+    CONDUIT_HS_INIT_SENT = 0,   /* initiator: INIT sent, awaiting RESP        */
+    CONDUIT_HS_LISTEN = 1,      /* responder: awaiting INIT                   */
+    CONDUIT_HS_RESP_SENT = 2,   /* responder: RESP sent, awaiting CONFIRM     */
+    CONDUIT_HS_ESTABLISHED = 3, /* handshake complete                         */
+    CONDUIT_HS_FAILED = 4       /* initiator: too many INIT attempts, gave up */
+} conduit_hs_state;
+
+typedef struct
+{
+    conduit_role role;
+    conduit_hs_state state;
+
+    uint32_t my_cid;   /* the CID this endpoint chose for itself       */
+    uint32_t peer_cid; /* the peer's CID (learned during the exchange) */
+    uint32_t token;    /* address-validation token for this handshake  */
+    int has_token;     /* whether `token` is populated yet             */
+
+    /* --- INIT retransmission (initiator only) --- */
+    uint32_t attempts;       /* INITs sent so far                       */
+    uint32_t max_attempts;   /* give up (FAILED) after this many        */
+    uint32_t backoff_ms;     /* current wait before the next INIT       */
+    uint32_t backoff_cap_ms; /* backoff never grows past this           */
+    uint64_t last_init_ms;   /* when the most recent INIT was sent      */
+} conduit_handshake_state;
+
+/* Initialize as the INITIATOR. `my_cid` is the CID this endpoint claims (MUST
+ * NOT be 0). The retransmission policy is injected: `initial_backoff_ms` is the
+ * first wait before re-sending INIT, doubling each attempt up to `backoff_cap_ms`,
+ * and the handshake FAILS after `max_attempts` INITs go unanswered. */
+void conduit_handshake_init_initiator(conduit_handshake_state *hs, uint32_t my_cid,
+                                      uint32_t initial_backoff_ms,
+                                      uint32_t backoff_cap_ms, uint32_t max_attempts);
+
+/* Initialize as the RESPONDER. `my_cid` is the CID this endpoint will assign to
+ * itself in RESP (MUST NOT be 0). The responder keeps no retransmission timer. */
+void conduit_handshake_init_responder(conduit_handshake_state *hs, uint32_t my_cid);
+
+/* Advance the initiator's clock to `now_ms`. Emits an INIT into `out` (capacity
+ * `cap`) and returns its length when one is due: immediately on the first tick,
+ * then again whenever the backoff elapses with no RESP. Returns 0 if nothing is
+ * due this tick, if the handshake is no longer INIT_SENT, or if the buffer is
+ * too small. May transition to CONDUIT_HS_FAILED once max_attempts is reached.
+ * Has no effect for a responder (returns 0). */
+size_t conduit_handshake_tick(conduit_handshake_state *hs, uint64_t now_ms,
+                              uint8_t *out, size_t cap);
+
+/* RESPONDER: handle a received INIT (already header-validated as HANDSHAKE_INIT).
+ * Records the initiator's CID and the caller-supplied `token`, emits a RESP into
+ * `out`, and moves to RESP_SENT. `token` is generated by the caller (this module
+ * does not depend on any RNG). Returns the RESP length, or 0 on parse failure /
+ * undersized buffer. Safe to call again on a repeat INIT: it re-issues RESP. */
+size_t conduit_handshake_on_init(conduit_handshake_state *hs,
+                                 const uint8_t *buf, size_t len, uint32_t token,
+                                 uint8_t *out, size_t cap);
+
+/* INITIATOR: handle a received RESP (already header-validated as HANDSHAKE_RESP).
+ * Records the responder's CID and token, emits a CONFIRM into `out`, and moves to
+ * ESTABLISHED. Returns the CONFIRM length, or 0 on parse failure / undersized
+ * buffer. A duplicate RESP after ESTABLISHED re-emits CONFIRM (harmless). */
+size_t conduit_handshake_on_resp(conduit_handshake_state *hs,
+                                 const uint8_t *buf, size_t len,
+                                 uint8_t *out, size_t cap);
+
+/* RESPONDER: handle a received CONFIRM (already header-validated as
+ * HANDSHAKE_CONFIRM). Verifies the echoed token matches the one issued in RESP;
+ * on match moves to ESTABLISHED and returns 1. Returns 0 on parse failure or
+ * token mismatch (the caller SHOULD drop the packet and stay in RESP_SENT). */
+int conduit_handshake_on_confirm(conduit_handshake_state *hs,
+                                 const uint8_t *buf, size_t len);
+
+/* Current handshake phase. */
+conduit_hs_state conduit_handshake_status(const conduit_handshake_state *hs);
+
+/* Once ESTABLISHED, the peer's chosen CID (the destination for packets we send).
+ * Returns 0 (CONDUIT_CID_UNSPECIFIED) before the peer CID is known. */
+uint32_t conduit_handshake_peer_cid(const conduit_handshake_state *hs);
 
 #endif /* CONDUIT_H */

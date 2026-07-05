@@ -256,6 +256,40 @@ CONFIRM (type `0x03`), header Connection ID = Responder CID:
 | ----- | ------ | -------------------------------- |
 | Token | 4      | The token from RESP, echoed back |
 
+#### 3.1.2. Loss handling
+
+The handshake carries no reliability metadata of its own, so robustness to loss
+is a property of the exchange rather than the wire format. The strategy below is
+RECOMMENDED; the specific timing parameters are an implementation concern and do
+not affect interoperability, since a peer cannot observe another endpoint's
+timers — only the packets they cause.
+
+A single retransmission timer suffices, on the initiator, and only for INIT:
+
+- **Lost INIT.** The initiator retransmits INIT if no RESP arrives within a
+  timeout. Retransmissions SHOULD use exponential backoff (a doubling delay up
+  to a cap) to avoid adding load to an already-congested path, and the initiator
+  SHOULD abandon the handshake after a bounded number of attempts.
+
+- **Lost RESP.** The responder does NOT keep a retransmission timer. A lost RESP
+  is recovered by the initiator's own INIT retransmission: a responder that
+  receives a repeat INIT simply issues a fresh RESP. Because the responder holds
+  no per-handshake timer, it is not forced to retain state for every INIT it has
+  ever seen — relevant to its exposure to spoofed or flooding traffic.
+
+- **Lost CONFIRM.** CONFIRM is NOT retransmitted. The initiator considers the
+  connection established once it has sent CONFIRM. If that CONFIRM is lost, the
+  responder never reaches the established state and ignores the initiator's
+  subsequent traffic; the initiator's keep-alive mechanism (Section 3.2) then
+  observes the unanswered connection and tears it down, after which it MAY
+  restart the handshake. Repairing the half-open state is thus delegated to the
+  liveness timeout ("local truth", Section 1.4) rather than to a dedicated
+  timer, keeping the responder free of handshake-completion state.
+
+A responder MUST treat handshake packets idempotently to the extent the above
+requires: a repeat INIT re-issues RESP, and a duplicate CONFIRM whose token
+matches is harmless.
+
 ### 3.2. Keep-Alive and RTT Measurement
 
 Once a connection is established, each endpoint detects whether its peer is still
@@ -373,11 +407,14 @@ trusted.
   and the critical/ignorable flag partition. Section 3.1 defines the
   three-message handshake (INIT / RESP / CONFIRM), connection-ID assignment, the
   address-validation token, and version handling; packet type `0x03`
-  (HANDSHAKE_CONFIRM) added. Section 3.2 defines the HEARTBEAT / HEARTBEAT_ACK
-  packet bodies (a 4-octet Sequence), the echo-based RTT correlation measured on
-  the sender's own clock, the idle-only rule, and local liveness-failure
-  detection. Section 3.3 defines connection termination: the best-effort CLOSE
-  packet (type `0x30`) with a 1-octet diagnostic Reason, symmetric teardown with
-  no half-close, and reliance on the keep-alive timeout when a CLOSE is lost.
-  Remaining lifecycle and wire-format sections are placeholders pending
-  implementation.
+  (HANDSHAKE_CONFIRM) added. Section 3.1.2 documents the RECOMMENDED handshake
+  loss-handling strategy: a single INIT-retransmission timer on the initiator
+  with exponential backoff, recovery of a lost RESP via repeat INIT, and reliance
+  on the keep-alive timeout for a lost CONFIRM. Section 3.2 defines the HEARTBEAT
+  / HEARTBEAT_ACK packet bodies (a 4-octet Sequence), the echo-based RTT
+  correlation measured on the sender's own clock, the idle-only rule, and local
+  liveness-failure detection. Section 3.3 defines connection termination: the
+  best-effort CLOSE packet (type `0x30`) with a 1-octet diagnostic Reason,
+  symmetric teardown with no half-close, and reliance on the keep-alive timeout
+  when a CLOSE is lost. Remaining lifecycle and wire-format sections are
+  placeholders pending implementation.
