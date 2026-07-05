@@ -206,6 +206,50 @@ conduit_result conduit_parse_heartbeat(const uint8_t *buf, size_t len,
 }
 
 /* ============================================================================
+ * Close builder and parser
+ *
+ * CLOSE carries a single Reason octet after the fixed header. It is best-effort:
+ * no ack, no retransmission (spec Section 3.3). See conduit.h for the rationale.
+ * ========================================================================== */
+
+size_t conduit_build_close(uint32_t dest_cid, uint8_t reason,
+                           uint8_t *buf, size_t cap)
+{
+    if (cap < CONDUIT_CLOSE_SIZE)
+        return 0;
+    conduit_header h = {dest_cid, CONDUIT_PKT_CLOSE, 0};
+    conduit_header_encode(&h, buf);
+    buf[CONDUIT_HEADER_SIZE + 0] = reason;
+    return CONDUIT_CLOSE_SIZE;
+}
+
+conduit_result conduit_parse_close(const uint8_t *buf, size_t len,
+                                   conduit_close *out)
+{
+    if (len < CONDUIT_CLOSE_SIZE)
+        return CONDUIT_ERR_TOO_SHORT;
+    out->reason = buf[CONDUIT_HEADER_SIZE + 0];
+    return CONDUIT_OK;
+}
+
+const char *conduit_close_reason_name(uint8_t reason)
+{
+    switch (reason)
+    {
+    case CONDUIT_CLOSE_NONE:
+        return "NONE";
+    case CONDUIT_CLOSE_APPLICATION:
+        return "APPLICATION";
+    case CONDUIT_CLOSE_SHUTDOWN:
+        return "SHUTDOWN";
+    case CONDUIT_CLOSE_PROTOCOL_ERROR:
+        return "PROTOCOL_ERROR";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+/* ============================================================================
  * Connection liveness and RTT
  * ========================================================================== */
 
@@ -267,6 +311,19 @@ void conduit_conn_note_recv(conduit_conn *c)
 {
     if (c->state == CONDUIT_CONN_ALIVE)
         c->inflight = 0;
+}
+
+void conduit_conn_close(conduit_conn *c)
+{
+    /* A peer already declared LOST cannot be gracefully closed; leave it LOST.
+     * From any other state, the connection becomes deliberately CLOSED. Once
+     * CLOSED, conduit_conn_tick() is inert and on_ack/note_recv are ignored,
+     * because those paths already guard on state == ALIVE. */
+    if (c->state == CONDUIT_CONN_ALIVE)
+    {
+        c->state = CONDUIT_CONN_CLOSED;
+        c->has_pending = 0; /* drop any outstanding probe: we're done */
+    }
 }
 
 conduit_conn_state conduit_conn_status(const conduit_conn *c)

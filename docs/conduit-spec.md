@@ -304,7 +304,43 @@ and are not part of the wire format.
 
 ### 3.3. Termination
 
-_To be specified._
+A connection is torn down with a single CLOSE packet. Termination is
+best-effort: CLOSE is neither acknowledged nor retransmitted. An endpoint that
+sends CLOSE considers the connection closed immediately; an endpoint that
+receives CLOSE does the same. Because delivery is not guaranteed, a lost CLOSE
+does not strand the peer: the peer still detects the vanished connection through
+the keep-alive liveness timeout (Section 3.2). Termination is thus a matter of
+"local truth" (Section 1.4) — each endpoint releases the connection on its own,
+and the two sides MAY do so at different times.
+
+CLOSE consists of the fixed header (Section 2.2) followed by a 1-octet Reason.
+
+CLOSE (type `0x30`), header Connection ID = destination CID:
+
+| Field  | Octets | Description                        |
+| ------ | ------ | ---------------------------------- |
+| Reason | 1      | Diagnostic reason for the closure  |
+
+Defined Reason values:
+
+| Value  | Name             | Meaning                                    |
+| ------ | ---------------- | ------------------------------------------ |
+| `0x00` | `NONE`           | Unspecified or graceful; no detail given   |
+| `0x01` | `APPLICATION`    | The application requested the close        |
+| `0x02` | `SHUTDOWN`       | The endpoint is shutting down / going away |
+| `0x03` | `PROTOCOL_ERROR` | The peer violated the protocol             |
+
+**Reason is diagnostic only.** The Reason exists for logging and observability.
+A receiver MUST NOT vary its teardown behavior based on the value — a CLOSE
+always terminates the connection. A receiver that does not recognize a Reason
+value MUST treat it as `NONE` and MUST still tear the connection down. Reason
+values MAY be added in later revisions without a wire change.
+
+**No half-close.** This revision defines a single, symmetric teardown: CLOSE
+ends the connection in both directions at once. There is no independent
+shutdown of one direction, and there is no defined packet to send on a
+connection after its CLOSE. Any packet received for a connection that has
+already been closed locally MUST be discarded.
 
 ## 4. Reliability Model
 
@@ -340,5 +376,8 @@ trusted.
   (HANDSHAKE_CONFIRM) added. Section 3.2 defines the HEARTBEAT / HEARTBEAT_ACK
   packet bodies (a 4-octet Sequence), the echo-based RTT correlation measured on
   the sender's own clock, the idle-only rule, and local liveness-failure
-  detection. Remaining lifecycle and wire-format sections are placeholders
-  pending implementation.
+  detection. Section 3.3 defines connection termination: the best-effort CLOSE
+  packet (type `0x30`) with a 1-octet diagnostic Reason, symmetric teardown with
+  no half-close, and reliance on the keep-alive timeout when a CLOSE is lost.
+  Remaining lifecycle and wire-format sections are placeholders pending
+  implementation.

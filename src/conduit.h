@@ -175,6 +175,54 @@ conduit_result conduit_parse_heartbeat(const uint8_t *buf, size_t len,
                                        conduit_heartbeat *out);
 
 /* ============================================================================
+ * Connection termination (CLOSE)
+ *
+ * CLOSE is a single, best-effort packet: the fixed header followed by a 1-octet
+ * Reason code. It is NOT acknowledged and NOT retransmitted (Section 3.3). The
+ * sender marks the connection closed and stops; the receiver does the same on
+ * arrival. If the CLOSE is lost, the peer still tears the connection down via
+ * the heartbeat liveness timeout (Section 3.2) -- this is "local truth"
+ * (Section 1.4): each endpoint decides locally, and the two sides may release
+ * the connection at slightly different times.
+ *
+ * The Reason is diagnostic only: a receiver MUST NOT change its teardown
+ * behavior based on the value (a close is a close), but SHOULD surface it for
+ * logging. An unrecognized Reason value MUST be treated as CONDUIT_CLOSE_NONE.
+ * ========================================================================== */
+
+/* CLOSE reason codes (the 1-octet body). Values are stable from the start;
+ * the list may grow without a wire change. */
+typedef enum
+{
+    CONDUIT_CLOSE_NONE = 0x00,        /* unspecified / graceful, no detail       */
+    CONDUIT_CLOSE_APPLICATION = 0x01, /* the application asked to close          */
+    CONDUIT_CLOSE_SHUTDOWN = 0x02,    /* endpoint is shutting down / going away  */
+    CONDUIT_CLOSE_PROTOCOL_ERROR = 0x03 /* peer violated the protocol            */
+} conduit_close_reason;
+
+/* CLOSE is the fixed header plus a 1-octet Reason. */
+#define CONDUIT_CLOSE_SIZE (CONDUIT_HEADER_SIZE + 1) /* + reason(1) */
+
+/* Parsed CLOSE body. */
+typedef struct
+{
+    uint8_t reason; /* one of conduit_close_reason (see note above) */
+} conduit_close;
+
+/* Builder: write a complete CLOSE addressed to `dest_cid` into `buf`
+ * (capacity `cap`). Returns bytes written, or 0 if `cap` is too small. */
+size_t conduit_build_close(uint32_t dest_cid, uint8_t reason,
+                           uint8_t *buf, size_t cap);
+
+/* Parser: read the Reason from a CLOSE whose fixed header has already been
+ * validated by conduit_header_decode(). */
+conduit_result conduit_parse_close(const uint8_t *buf, size_t len,
+                                   conduit_close *out);
+
+/* Human-readable name of a CLOSE reason (for logging / debugging). */
+const char *conduit_close_reason_name(uint8_t reason);
+
+/* ============================================================================
  * Connection liveness and RTT (established connections)
  *
  * Minimal, time-injected state for keeping an established connection alive and
@@ -189,7 +237,8 @@ conduit_result conduit_parse_heartbeat(const uint8_t *buf, size_t len,
 typedef enum
 {
     CONDUIT_CONN_ALIVE = 0,
-    CONDUIT_CONN_LOST = 1
+    CONDUIT_CONN_LOST = 1,  /* peer stopped answering: detected via timeout   */
+    CONDUIT_CONN_CLOSED = 2 /* torn down deliberately (we sent/received CLOSE) */
 } conduit_conn_state;
 
 typedef struct
@@ -227,6 +276,13 @@ void conduit_conn_on_ack(conduit_conn *c, uint32_t acked_seq, uint64_t now_ms);
 
 /* Record that some packet from the peer arrived (any packet is a sign of life). */
 void conduit_conn_note_recv(conduit_conn *c);
+
+/* Mark the connection as deliberately closed. After this the connection is
+ * inert: conduit_conn_tick() emits nothing and never transitions to LOST, and
+ * acks/receives are ignored. Call this both when we originate a CLOSE and when
+ * we receive one from the peer. A connection already LOST stays LOST (a dead
+ * peer cannot be gracefully closed); otherwise it becomes CLOSED. */
+void conduit_conn_close(conduit_conn *c);
 
 /* Current liveness state. */
 conduit_conn_state conduit_conn_status(const conduit_conn *c);

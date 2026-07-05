@@ -94,6 +94,31 @@ int main(void)
     conduit_heartbeat hb2;
     CHECK(conduit_parse_heartbeat(buf, CONDUIT_HEADER_SIZE + 1, &hb2) == CONDUIT_ERR_TOO_SHORT);
 
+    /* ---- close ---- */
+    TEST("close round-trip");
+    size_t cl_len = conduit_build_close(0x0000BBBBu, CONDUIT_CLOSE_APPLICATION, buf, sizeof(buf));
+    CHECK_EQ_SIZE(cl_len, CONDUIT_CLOSE_SIZE);
+    CHECK(conduit_header_decode(buf, cl_len, &h) == CONDUIT_OK);
+    CHECK(h.type == CONDUIT_PKT_CLOSE);
+    CHECK_EQ_U32(h.connection_id, 0x0000BBBBu);
+    conduit_close cl;
+    CHECK(conduit_parse_close(buf, cl_len, &cl) == CONDUIT_OK);
+    CHECK_EQ_U32(cl.reason, CONDUIT_CLOSE_APPLICATION);
+
+    TEST("close: builder refuses an undersized buffer");
+    CHECK_EQ_SIZE(conduit_build_close(1u, CONDUIT_CLOSE_NONE, buf, CONDUIT_CLOSE_SIZE - 1), 0u);
+
+    TEST("reject truncated close body");
+    conduit_close cl2;
+    CHECK(conduit_parse_close(buf, CONDUIT_HEADER_SIZE, &cl2) == CONDUIT_ERR_TOO_SHORT);
+
+    TEST("close: unknown reason is preserved verbatim");
+    /* Reason is diagnostic: an unrecognized value parses fine and is not remapped. */
+    size_t cu_len = conduit_build_close(1u, 0xFFu, buf, sizeof(buf));
+    conduit_close cl3;
+    CHECK(conduit_parse_close(buf, cu_len, &cl3) == CONDUIT_OK);
+    CHECK_EQ_U32(cl3.reason, 0xFFu);
+
     /* ---- liveness / RTT (deterministic, simulated clock) ---- */
     TEST("liveness: heartbeat fires only after the idle interval");
     conduit_conn c;
@@ -124,6 +149,30 @@ int main(void)
     CHECK(conduit_conn_status(&c2) == CONDUIT_CONN_ALIVE);
     CHECK_EQ_SIZE(conduit_conn_tick(&c2, 4000, buf, sizeof(buf)), 0u); /* #4 -> lost */
     CHECK(conduit_conn_status(&c2) == CONDUIT_CONN_LOST);
+
+    /* ---- termination (CLOSE) ---- */
+    TEST("close: ALIVE -> CLOSED and tick becomes inert");
+    conduit_conn c3;
+    conduit_conn_init(&c3, 0x0000BBBBu, 1000u, 3u);
+    CHECK(conduit_conn_status(&c3) == CONDUIT_CONN_ALIVE);
+    conduit_conn_close(&c3);
+    CHECK(conduit_conn_status(&c3) == CONDUIT_CONN_CLOSED);
+    /* Even long past the interval, a CLOSED connection emits nothing and does
+     * not transition to LOST. */
+    CHECK_EQ_SIZE(conduit_conn_tick(&c3, 100000u, buf, sizeof(buf)), 0u);
+    CHECK(conduit_conn_status(&c3) == CONDUIT_CONN_CLOSED);
+
+    TEST("close: a LOST connection stays LOST");
+    /* A peer already declared dead cannot be gracefully closed. */
+    conduit_conn c4;
+    conduit_conn_init(&c4, 0x0000BBBBu, 1000u, 3u);
+    conduit_conn_tick(&c4, 1000, buf, sizeof(buf)); /* probe 1 */
+    conduit_conn_tick(&c4, 2000, buf, sizeof(buf)); /* probe 2 */
+    conduit_conn_tick(&c4, 3000, buf, sizeof(buf)); /* probe 3 */
+    conduit_conn_tick(&c4, 4000, buf, sizeof(buf)); /* #4 -> lost */
+    CHECK(conduit_conn_status(&c4) == CONDUIT_CONN_LOST);
+    conduit_conn_close(&c4);
+    CHECK(conduit_conn_status(&c4) == CONDUIT_CONN_LOST);
 
     return test_summary();
 }
