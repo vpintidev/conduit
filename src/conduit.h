@@ -25,6 +25,7 @@ typedef enum
     CONDUIT_PKT_HANDSHAKE_RESP = 0x02,    /* responder -> initiator: CID + token  */
     CONDUIT_PKT_HANDSHAKE_CONFIRM = 0x03, /* initiator -> responder: echo token   */
     CONDUIT_PKT_DATA = 0x10,              /* application payload                  */
+    CONDUIT_PKT_DATA_ACK = 0x11,          /* acknowledge reliable DATA (cumulative)*/
     CONDUIT_PKT_HEARTBEAT = 0x20,         /* liveness probe (also drives RTT)     */
     CONDUIT_PKT_HEARTBEAT_ACK = 0x21,     /* reply to a heartbeat                 */
     CONDUIT_PKT_CLOSE = 0x30              /* best-effort connection close         */
@@ -194,9 +195,9 @@ conduit_result conduit_parse_heartbeat(const uint8_t *buf, size_t len,
  * the list may grow without a wire change. */
 typedef enum
 {
-    CONDUIT_CLOSE_NONE = 0x00,          /* unspecified / graceful, no detail       */
-    CONDUIT_CLOSE_APPLICATION = 0x01,   /* the application asked to close          */
-    CONDUIT_CLOSE_SHUTDOWN = 0x02,      /* endpoint is shutting down / going away  */
+    CONDUIT_CLOSE_NONE = 0x00,        /* unspecified / graceful, no detail       */
+    CONDUIT_CLOSE_APPLICATION = 0x01, /* the application asked to close          */
+    CONDUIT_CLOSE_SHUTDOWN = 0x02,    /* endpoint is shutting down / going away  */
     CONDUIT_CLOSE_PROTOCOL_ERROR = 0x03 /* peer violated the protocol            */
 } conduit_close_reason;
 
@@ -335,7 +336,7 @@ typedef enum
 /* Handshake phase. FAILED is terminal (initiator gave up after too many INITs). */
 typedef enum
 {
-    CONDUIT_HS_INIT_SENT = 0,   /* initiator: INIT sent, awaiting RESP        */
+    CONDUIT_HS_INIT_SENT = 0,  /* initiator: INIT sent, awaiting RESP        */
     CONDUIT_HS_LISTEN = 1,      /* responder: awaiting INIT                   */
     CONDUIT_HS_RESP_SENT = 2,   /* responder: RESP sent, awaiting CONFIRM     */
     CONDUIT_HS_ESTABLISHED = 3, /* handshake complete                         */
@@ -353,11 +354,11 @@ typedef struct
     int has_token;     /* whether `token` is populated yet             */
 
     /* --- INIT retransmission (initiator only) --- */
-    uint32_t attempts;       /* INITs sent so far                       */
-    uint32_t max_attempts;   /* give up (FAILED) after this many        */
-    uint32_t backoff_ms;     /* current wait before the next INIT       */
-    uint32_t backoff_cap_ms; /* backoff never grows past this           */
-    uint64_t last_init_ms;   /* when the most recent INIT was sent      */
+    uint32_t attempts;      /* INITs sent so far                       */
+    uint32_t max_attempts;  /* give up (FAILED) after this many        */
+    uint32_t backoff_ms;    /* current wait before the next INIT       */
+    uint32_t backoff_cap_ms;/* backoff never grows past this           */
+    uint64_t last_init_ms;  /* when the most recent INIT was sent      */
 } conduit_handshake_state;
 
 /* Initialize as the INITIATOR. `my_cid` is the CID this endpoint claims (MUST
@@ -411,5 +412,184 @@ conduit_hs_state conduit_handshake_status(const conduit_handshake_state *hs);
 /* Once ESTABLISHED, the peer's chosen CID (the destination for packets we send).
  * Returns 0 (CONDUIT_CID_UNSPECIFIED) before the peer CID is known. */
 uint32_t conduit_handshake_peer_cid(const conduit_handshake_state *hs);
+
+/* ============================================================================
+ * Reliability: DATA / DATA_ACK wire format (Section 4)
+ *
+ * A reliable DATA packet is the fixed header, a 4-byte Sequence Number, then the
+ * application payload. A DATA_ACK is the fixed header and a 4-byte cumulative
+ * Acknowledgement Number. Sequence 0 is reserved (means "none"); the first DATA
+ * uses sequence 1. See conduit.h Section 4 of the spec for the full model.
+ * ========================================================================== */
+
+/* Overhead a reliable DATA packet adds before the payload (header + sequence). */
+#define CONDUIT_DATA_HEADER_SIZE (CONDUIT_HEADER_SIZE + 4) /* + sequence(4) */
+/* A DATA_ACK is the fixed header plus a 4-byte cumulative ack number. */
+#define CONDUIT_DATA_ACK_SIZE (CONDUIT_HEADER_SIZE + 4)    /* + ack(4) */
+
+/* Sequence 0 is reserved to mean "no sequence"; real DATA starts at 1. */
+#define CONDUIT_SEQ_NONE 0u
+
+/* Parsed views. conduit_data.payload points into the caller's buffer (no copy);
+ * it is valid only as long as that buffer is. */
+typedef struct
+{
+    uint32_t sequence;
+    const uint8_t *payload;
+    size_t payload_len;
+} conduit_data;
+typedef struct
+{
+    uint32_t ack; /* cumulative: highest in-sequence sequence received */
+} conduit_data_ack;
+
+/* Build a reliable DATA packet addressed to `dest_cid`: header + `sequence` +
+ * the `payload_len` bytes at `payload` (payload MAY be empty). Returns the total
+ * bytes written, or 0 if `cap` is too small. */
+size_t conduit_build_data(uint32_t dest_cid, uint32_t sequence,
+                          const uint8_t *payload, size_t payload_len,
+                          uint8_t *buf, size_t cap);
+
+/* Build a DATA_ACK addressed to `dest_cid` carrying cumulative `ack`. Returns
+ * bytes written, or 0 if `cap` is too small. */
+size_t conduit_build_data_ack(uint32_t dest_cid, uint32_t ack,
+                              uint8_t *buf, size_t cap);
+
+/* Parse a DATA body (header already validated by conduit_header_decode). Fills
+ * `out` with the sequence and a pointer to the payload inside `buf`. */
+conduit_result conduit_parse_data(const uint8_t *buf, size_t len,
+                                  conduit_data *out);
+
+/* Parse a DATA_ACK body (header already validated). */
+conduit_result conduit_parse_data_ack(const uint8_t *buf, size_t len,
+                                      conduit_data_ack *out);
+
+/* ============================================================================
+ * Reliability: receiver (Section 4.2, 4.4)
+ *
+ * Tracks which reliable DATA sequences have arrived so it can (a) tell the
+ * sender the cumulative acknowledgement number and (b) discard duplicates. It
+ * keeps a cumulative point -- every sequence at or below it has been received --
+ * plus a fixed bitmap of sequences received just above it. As the cumulative
+ * point advances, the window slides forward. This revision does NOT reorder: the
+ * caller delivers each new payload to the application immediately.
+ * ========================================================================== */
+
+/* Width of the duplicate-detection window above the cumulative point. */
+#define CONDUIT_RECV_WINDOW 64
+
+typedef enum
+{
+    CONDUIT_RECV_NEW = 0,      /* first time we've seen this sequence     */
+    CONDUIT_RECV_DUPLICATE = 1,/* already received (or at/below cumulative)*/
+    CONDUIT_RECV_INVALID = 2   /* sequence 0, or too far ahead of window  */
+} conduit_recv_result;
+
+typedef struct
+{
+    uint32_t cumulative;             /* all sequences <= this were received */
+    uint64_t bitmap;                 /* bit i set => (cumulative + 1 + i) seen */
+} conduit_rx;
+
+/* Initialize a receiver with nothing yet received (cumulative = 0). */
+void conduit_rx_init(conduit_rx *rx);
+
+/* Record reception of `sequence`. Returns:
+ *   CONDUIT_RECV_NEW       -> caller SHOULD deliver this payload to the app
+ *   CONDUIT_RECV_DUPLICATE -> caller MUST drop the payload (but SHOULD still ack)
+ *   CONDUIT_RECV_INVALID   -> sequence 0, or so far ahead it falls outside the
+ *                             window; caller MUST drop it
+ * In all non-INVALID cases the cumulative acknowledgement is updated. */
+conduit_recv_result conduit_rx_on_data(conduit_rx *rx, uint32_t sequence);
+
+/* The cumulative acknowledgement number to put in a DATA_ACK. */
+uint32_t conduit_rx_ack(const conduit_rx *rx);
+
+/* ============================================================================
+ * Reliability: sender (Section 4.3, 4.5)
+ *
+ * Sends reliable DATA with pipelining up to a fixed window, retransmits packets
+ * whose cumulative ACK has not arrived within an adaptively-computed RTO, and
+ * measures RTT from the data path itself to drive that RTO. Time is injected via
+ * _tick()/_on_ack(); the sender never reads the clock, so it is unit-testable
+ * with a simulated clock, like conduit_conn and conduit_handshake_state.
+ *
+ * RTO: a smoothed RTT and RTT-variation estimate (Jacobson/Karels) updated from
+ * each RTT sample, with RTO = srtt + 4*rttvar clamped to a minimum, and an
+ * initial RTO before the first sample. Per Karn's algorithm, no RTT sample is
+ * taken from a packet that was retransmitted; retransmissions still back off
+ * (doubling RTO, capped).
+ * ========================================================================== */
+
+/* Send window and per-packet payload cap. The window MUST NOT exceed the
+ * receiver's CONDUIT_RECV_WINDOW so an in-window packet is always trackable. */
+#define CONDUIT_SEND_WINDOW 32
+#define CONDUIT_MAX_PAYLOAD 1200 /* bytes of app data per reliable DATA packet */
+
+/* One outstanding (unacknowledged) reliable DATA packet. */
+typedef struct
+{
+    int in_use;
+    uint32_t sequence;
+    uint8_t payload[CONDUIT_MAX_PAYLOAD];
+    size_t payload_len;
+    uint64_t last_send_ms;   /* when it was most recently (re)sent          */
+    uint64_t rexmit_at_ms;   /* when to retransmit if still unacked         */
+    uint32_t transmits;      /* how many times sent (>1 => no RTT sample)   */
+    uint32_t rto_ms;         /* per-packet RTO in force (grows on backoff)  */
+} conduit_tx_slot;
+
+typedef struct
+{
+    uint32_t peer_cid;    /* destination CID for packets we send            */
+    uint32_t next_seq;    /* sequence for the next new DATA (starts at 1)   */
+    uint32_t base_ack;    /* highest cumulative ACK received so far         */
+
+    /* RTO estimator (all in ms; srtt/rttvar are fixed-point-free, plain ms). */
+    int have_srtt;        /* whether a first sample has been taken          */
+    uint32_t srtt_ms;     /* smoothed RTT                                   */
+    uint32_t rttvar_ms;   /* RTT variation                                  */
+    uint32_t rto_base_ms; /* current base RTO from the estimator            */
+    uint32_t rto_min_ms;  /* lower clamp on RTO                             */
+    uint32_t rto_max_ms;  /* cap on a single packet's backed-off RTO        */
+
+    conduit_tx_slot slots[CONDUIT_SEND_WINDOW];
+    uint32_t outstanding; /* number of slots in use                         */
+} conduit_tx;
+
+/* Initialize a sender. `peer_cid` is the destination CID. `initial_rto_ms` is
+ * the RTO used before any RTT sample; `rto_min_ms` clamps the estimate from
+ * below; `rto_max_ms` caps a single packet's backed-off RTO. */
+void conduit_tx_init(conduit_tx *tx, uint32_t peer_cid,
+                     uint32_t initial_rto_ms, uint32_t rto_min_ms,
+                     uint32_t rto_max_ms);
+
+/* True if a new reliable DATA may be queued (window not full). */
+int conduit_tx_can_send(const conduit_tx *tx);
+
+/* Queue and build a new reliable DATA carrying `payload` (`payload_len` bytes,
+ * <= CONDUIT_MAX_PAYLOAD). Writes the packet into `out` and returns its length,
+ * assigning the next sequence and recording it for possible retransmission.
+ * Returns 0 if the window is full, the payload is too large, or `cap` is too
+ * small. `now_ms` is the send time (starts the RTO clock for this packet). */
+size_t conduit_tx_send(conduit_tx *tx, const uint8_t *payload, size_t payload_len,
+                       uint64_t now_ms, uint8_t *out, size_t cap);
+
+/* Advance time to `now_ms`. If any outstanding packet is due for retransmission,
+ * write it into `out`, back off its RTO, and return its length; otherwise return
+ * 0. Call repeatedly until it returns 0 to flush all due retransmissions. */
+size_t conduit_tx_tick(conduit_tx *tx, uint64_t now_ms, uint8_t *out, size_t cap);
+
+/* Record a received cumulative ACK at `now_ms`. Releases every outstanding
+ * packet with sequence <= `ack`, and updates the RTO estimator from any of them
+ * that were sent exactly once (Karn's algorithm). */
+void conduit_tx_on_ack(conduit_tx *tx, uint32_t ack, uint64_t now_ms);
+
+/* Number of unacknowledged packets currently outstanding. */
+uint32_t conduit_tx_outstanding(const conduit_tx *tx);
+
+/* Current RTO the estimator would use for a first transmission (for tests /
+ * observability). Before any sample, this is the initial RTO. */
+uint32_t conduit_tx_rto_ms(const conduit_tx *tx);
 
 #endif /* CONDUIT_H */

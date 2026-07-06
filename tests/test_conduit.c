@@ -290,5 +290,201 @@ int main(void)
         CHECK(conduit_handshake_status(&res) == CONDUIT_HS_ESTABLISHED);
     }
 
+    /* ---- reliability: DATA / DATA_ACK wire format ---- */
+    TEST("data round-trip with payload");
+    {
+        const uint8_t payload[] = {0xDE, 0xAD, 0xBE, 0xEF, 0x42};
+        size_t dn = conduit_build_data(0x0000BBBBu, 7u, payload, sizeof(payload),
+                                       buf, sizeof(buf));
+        CHECK_EQ_SIZE(dn, CONDUIT_DATA_HEADER_SIZE + sizeof(payload));
+        CHECK(conduit_header_decode(buf, dn, &h) == CONDUIT_OK);
+        CHECK(h.type == CONDUIT_PKT_DATA);
+        CHECK_EQ_U32(h.connection_id, 0x0000BBBBu);
+        conduit_data d;
+        CHECK(conduit_parse_data(buf, dn, &d) == CONDUIT_OK);
+        CHECK_EQ_U32(d.sequence, 7u);
+        CHECK_EQ_SIZE(d.payload_len, sizeof(payload));
+        CHECK(d.payload[0] == 0xDE && d.payload[4] == 0x42);
+    }
+
+    TEST("data with empty payload, and ack round-trip");
+    {
+        size_t dn = conduit_build_data(0x0000BBBBu, 1u, NULL, 0, buf, sizeof(buf));
+        CHECK_EQ_SIZE(dn, CONDUIT_DATA_HEADER_SIZE);
+        conduit_data d;
+        CHECK(conduit_parse_data(buf, dn, &d) == CONDUIT_OK);
+        CHECK_EQ_SIZE(d.payload_len, 0u);
+
+        size_t an = conduit_build_data_ack(0x0000AAAAu, 42u, buf, sizeof(buf));
+        CHECK_EQ_SIZE(an, CONDUIT_DATA_ACK_SIZE);
+        CHECK(conduit_header_decode(buf, an, &h) == CONDUIT_OK);
+        CHECK(h.type == CONDUIT_PKT_DATA_ACK);
+        conduit_data_ack a;
+        CHECK(conduit_parse_data_ack(buf, an, &a) == CONDUIT_OK);
+        CHECK_EQ_U32(a.ack, 42u);
+    }
+
+    TEST("reject truncated data and data_ack");
+    {
+        conduit_data d;
+        CHECK(conduit_parse_data(buf, CONDUIT_HEADER_SIZE + 2, &d) == CONDUIT_ERR_TOO_SHORT);
+        conduit_data_ack a;
+        CHECK(conduit_parse_data_ack(buf, CONDUIT_HEADER_SIZE + 1, &a) == CONDUIT_ERR_TOO_SHORT);
+    }
+
+    /* ---- reliability: receiver (dedup + cumulative ack) ---- */
+    TEST("receiver: in-order delivery advances the cumulative ack");
+    {
+        conduit_rx rx;
+        conduit_rx_init(&rx);
+        CHECK_EQ_U32(conduit_rx_ack(&rx), 0u);
+        CHECK(conduit_rx_on_data(&rx, 1u) == CONDUIT_RECV_NEW);
+        CHECK(conduit_rx_on_data(&rx, 2u) == CONDUIT_RECV_NEW);
+        CHECK(conduit_rx_on_data(&rx, 3u) == CONDUIT_RECV_NEW);
+        CHECK_EQ_U32(conduit_rx_ack(&rx), 3u);
+    }
+
+    TEST("receiver: duplicates are detected and do not advance the ack");
+    {
+        conduit_rx rx;
+        conduit_rx_init(&rx);
+        CHECK(conduit_rx_on_data(&rx, 1u) == CONDUIT_RECV_NEW);
+        CHECK(conduit_rx_on_data(&rx, 1u) == CONDUIT_RECV_DUPLICATE); /* retransmit */
+        CHECK(conduit_rx_on_data(&rx, 2u) == CONDUIT_RECV_NEW);
+        CHECK(conduit_rx_on_data(&rx, 1u) == CONDUIT_RECV_DUPLICATE); /* below cumu. */
+        CHECK_EQ_U32(conduit_rx_ack(&rx), 2u);
+    }
+
+    TEST("receiver: a gap stalls the cumulative ack until it is filled");
+    {
+        conduit_rx rx;
+        conduit_rx_init(&rx);
+        CHECK(conduit_rx_on_data(&rx, 1u) == CONDUIT_RECV_NEW);
+        /* 2 is lost; 3 and 4 arrive out of order relative to the gap */
+        CHECK(conduit_rx_on_data(&rx, 3u) == CONDUIT_RECV_NEW);
+        CHECK(conduit_rx_on_data(&rx, 4u) == CONDUIT_RECV_NEW);
+        CHECK_EQ_U32(conduit_rx_ack(&rx), 1u); /* still stuck at 1: 2 missing */
+        /* the retransmitted 2 arrives: the ack should jump to 4 */
+        CHECK(conduit_rx_on_data(&rx, 2u) == CONDUIT_RECV_NEW);
+        CHECK_EQ_U32(conduit_rx_ack(&rx), 4u);
+    }
+
+    TEST("receiver: sequence 0 is invalid; far-future is out of window");
+    {
+        conduit_rx rx;
+        conduit_rx_init(&rx);
+        CHECK(conduit_rx_on_data(&rx, 0u) == CONDUIT_RECV_INVALID);
+        /* cumulative is 0; window is CONDUIT_RECV_WINDOW wide above it. A
+         * sequence past the window edge cannot be tracked. */
+        CHECK(conduit_rx_on_data(&rx, (uint32_t)CONDUIT_RECV_WINDOW + 1u)
+              == CONDUIT_RECV_INVALID);
+        /* the last in-window sequence is accepted */
+        CHECK(conduit_rx_on_data(&rx, (uint32_t)CONDUIT_RECV_WINDOW)
+              == CONDUIT_RECV_NEW);
+    }
+
+    /* ---- reliability: sender (window, RTT/RTO, Karn, retransmission) ---- */
+    TEST("sender: assigns sequences from 1 and tracks outstanding");
+    {
+        conduit_tx tx;
+        conduit_tx_init(&tx, 0x0000BBBBu, 600u /*init rto*/, 100u /*min*/, 4000u /*max*/);
+        CHECK_EQ_U32(conduit_tx_outstanding(&tx), 0u);
+        uint8_t out[64];
+        size_t n1 = conduit_tx_send(&tx, NULL, 0, 0u, out, sizeof(out));
+        CHECK_EQ_SIZE(n1, CONDUIT_DATA_HEADER_SIZE);
+        conduit_data d;
+        CHECK(conduit_parse_data(out, n1, &d) == CONDUIT_OK);
+        CHECK_EQ_U32(d.sequence, 1u);
+        conduit_tx_send(&tx, NULL, 0, 0u, out, sizeof(out));
+        CHECK(conduit_parse_data(out, CONDUIT_DATA_HEADER_SIZE, &d) == CONDUIT_OK);
+        CHECK_EQ_U32(d.sequence, 2u);
+        CHECK_EQ_U32(conduit_tx_outstanding(&tx), 2u);
+    }
+
+    TEST("sender: a cumulative ack releases all covered packets");
+    {
+        conduit_tx tx;
+        conduit_tx_init(&tx, 0x0000BBBBu, 600u, 100u, 4000u);
+        uint8_t out[64];
+        conduit_tx_send(&tx, NULL, 0, 0u, out, sizeof(out)); /* seq 1 */
+        conduit_tx_send(&tx, NULL, 0, 0u, out, sizeof(out)); /* seq 2 */
+        conduit_tx_send(&tx, NULL, 0, 0u, out, sizeof(out)); /* seq 3 */
+        CHECK_EQ_U32(conduit_tx_outstanding(&tx), 3u);
+        conduit_tx_on_ack(&tx, 2u, 100u); /* releases 1 and 2, not 3 */
+        CHECK_EQ_U32(conduit_tx_outstanding(&tx), 1u);
+    }
+
+    TEST("sender: RTT sample drives the Jacobson RTO (200,200,260 ms)");
+    {
+        conduit_tx tx;
+        conduit_tx_init(&tx, 0x0000BBBBu, 600u, 100u, 4000u);
+        uint8_t out[64];
+        /* Before any sample, RTO is the configured initial value. */
+        CHECK_EQ_U32(conduit_tx_rto_ms(&tx), 600u);
+        /* seq 1 sent at t=0, acked at t=200 -> sample 200 */
+        conduit_tx_send(&tx, NULL, 0, 0u, out, sizeof(out));
+        conduit_tx_on_ack(&tx, 1u, 200u);
+        CHECK_EQ_U32(conduit_tx_rto_ms(&tx), 600u); /* srtt200 var100 -> 600 */
+        /* seq 2 sent at t=200, acked at t=400 -> sample 200 */
+        conduit_tx_send(&tx, NULL, 0, 200u, out, sizeof(out));
+        conduit_tx_on_ack(&tx, 2u, 400u);
+        CHECK_EQ_U32(conduit_tx_rto_ms(&tx), 500u); /* var75 -> 500 */
+        /* seq 3 sent at t=400, acked at t=660 -> sample 260 */
+        conduit_tx_send(&tx, NULL, 0, 400u, out, sizeof(out));
+        conduit_tx_on_ack(&tx, 3u, 660u);
+        CHECK_EQ_U32(conduit_tx_rto_ms(&tx), 491u); /* srtt207 var71 -> 491 */
+    }
+
+    TEST("sender: retransmits after the RTO and backs off");
+    {
+        conduit_tx tx;
+        conduit_tx_init(&tx, 0x0000BBBBu, 500u /*init rto*/, 100u, 4000u);
+        uint8_t out[64];
+        /* seq 1 sent at t=0; rexmit due at t=500 */
+        conduit_tx_send(&tx, NULL, 0, 0u, out, sizeof(out));
+        CHECK_EQ_SIZE(conduit_tx_tick(&tx, 499u, out, sizeof(out)), 0u); /* not yet */
+        size_t r1 = conduit_tx_tick(&tx, 500u, out, sizeof(out));       /* due */
+        CHECK_EQ_SIZE(r1, CONDUIT_DATA_HEADER_SIZE);
+        conduit_data d;
+        CHECK(conduit_parse_data(out, r1, &d) == CONDUIT_OK);
+        CHECK_EQ_U32(d.sequence, 1u); /* same sequence retransmitted */
+        /* backed off to 1000ms: next rexmit due at t=1500, not before */
+        CHECK_EQ_SIZE(conduit_tx_tick(&tx, 1499u, out, sizeof(out)), 0u);
+        CHECK_EQ_SIZE(conduit_tx_tick(&tx, 1500u, out, sizeof(out)), CONDUIT_DATA_HEADER_SIZE);
+    }
+
+    TEST("sender: Karn's algorithm skips the RTT sample for a retransmit");
+    {
+        conduit_tx tx;
+        conduit_tx_init(&tx, 0x0000BBBBu, 500u, 100u, 4000u);
+        uint8_t out[64];
+        conduit_tx_send(&tx, NULL, 0, 0u, out, sizeof(out)); /* seq 1 at t=0 */
+        conduit_tx_tick(&tx, 500u, out, sizeof(out));        /* retransmit seq 1 */
+        /* Ack arrives at t=600. Because seq 1 was retransmitted, NO RTT sample is
+         * taken: the RTO estimator stays at its pre-sample initial value. */
+        conduit_tx_on_ack(&tx, 1u, 600u);
+        CHECK_EQ_U32(conduit_tx_outstanding(&tx), 0u); /* still released */
+        CHECK_EQ_U32(conduit_tx_rto_ms(&tx), 500u);    /* unchanged: no sample */
+    }
+
+    TEST("sender: window fills and reopens as acks arrive");
+    {
+        conduit_tx tx;
+        conduit_tx_init(&tx, 0x0000BBBBu, 500u, 100u, 4000u);
+        uint8_t out[1300];
+        /* Fill the whole send window. */
+        for (int i = 0; i < CONDUIT_SEND_WINDOW; i++)
+        {
+            CHECK(conduit_tx_can_send(&tx) == 1);
+            CHECK(conduit_tx_send(&tx, NULL, 0, 0u, out, sizeof(out)) > 0);
+        }
+        CHECK(conduit_tx_can_send(&tx) == 0); /* full */
+        CHECK_EQ_SIZE(conduit_tx_send(&tx, NULL, 0, 0u, out, sizeof(out)), 0u);
+        /* Ack half of them; the window reopens. */
+        conduit_tx_on_ack(&tx, (uint32_t)(CONDUIT_SEND_WINDOW / 2), 100u);
+        CHECK(conduit_tx_can_send(&tx) == 1);
+        CHECK_EQ_U32(conduit_tx_outstanding(&tx), (uint32_t)(CONDUIT_SEND_WINDOW / 2));
+    }
+
     return test_summary();
 }

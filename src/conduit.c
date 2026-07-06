@@ -67,6 +67,8 @@ const char *conduit_packet_type_name(uint8_t type)
         return "HANDSHAKE_CONFIRM";
     case CONDUIT_PKT_DATA:
         return "DATA";
+    case CONDUIT_PKT_DATA_ACK:
+        return "DATA_ACK";
     case CONDUIT_PKT_HEARTBEAT:
         return "HEARTBEAT";
     case CONDUIT_PKT_HEARTBEAT_ACK:
@@ -491,4 +493,246 @@ conduit_hs_state conduit_handshake_status(const conduit_handshake_state *hs)
 uint32_t conduit_handshake_peer_cid(const conduit_handshake_state *hs)
 {
     return hs->peer_cid;
+}
+
+/* ============================================================================
+ * Reliability: DATA / DATA_ACK wire format (Section 4)
+ * ========================================================================== */
+
+size_t conduit_build_data(uint32_t dest_cid, uint32_t sequence,
+                          const uint8_t *payload, size_t payload_len,
+                          uint8_t *buf, size_t cap)
+{
+    if (cap < CONDUIT_DATA_HEADER_SIZE + payload_len)
+        return 0;
+    conduit_header h = {dest_cid, CONDUIT_PKT_DATA, 0};
+    conduit_header_encode(&h, buf);
+    put_u32(buf + CONDUIT_HEADER_SIZE, sequence);
+    if (payload_len > 0)
+        memcpy(buf + CONDUIT_DATA_HEADER_SIZE, payload, payload_len);
+    return CONDUIT_DATA_HEADER_SIZE + payload_len;
+}
+
+size_t conduit_build_data_ack(uint32_t dest_cid, uint32_t ack,
+                              uint8_t *buf, size_t cap)
+{
+    if (cap < CONDUIT_DATA_ACK_SIZE)
+        return 0;
+    conduit_header h = {dest_cid, CONDUIT_PKT_DATA_ACK, 0};
+    conduit_header_encode(&h, buf);
+    put_u32(buf + CONDUIT_HEADER_SIZE, ack);
+    return CONDUIT_DATA_ACK_SIZE;
+}
+
+conduit_result conduit_parse_data(const uint8_t *buf, size_t len,
+                                  conduit_data *out)
+{
+    if (len < CONDUIT_DATA_HEADER_SIZE)
+        return CONDUIT_ERR_TOO_SHORT;
+    out->sequence = get_u32(buf + CONDUIT_HEADER_SIZE);
+    out->payload = buf + CONDUIT_DATA_HEADER_SIZE;
+    out->payload_len = len - CONDUIT_DATA_HEADER_SIZE;
+    return CONDUIT_OK;
+}
+
+conduit_result conduit_parse_data_ack(const uint8_t *buf, size_t len,
+                                      conduit_data_ack *out)
+{
+    if (len < CONDUIT_DATA_ACK_SIZE)
+        return CONDUIT_ERR_TOO_SHORT;
+    out->ack = get_u32(buf + CONDUIT_HEADER_SIZE);
+    return CONDUIT_OK;
+}
+
+/* ============================================================================
+ * Reliability: receiver (Section 4.2, 4.4)
+ * ========================================================================== */
+
+void conduit_rx_init(conduit_rx *rx)
+{
+    rx->cumulative = 0;
+    rx->bitmap = 0;
+}
+
+conduit_recv_result conduit_rx_on_data(conduit_rx *rx, uint32_t sequence)
+{
+    if (sequence == CONDUIT_SEQ_NONE)
+        return CONDUIT_RECV_INVALID;
+
+    /* Already covered by the cumulative point: a duplicate. */
+    if (sequence <= rx->cumulative)
+        return CONDUIT_RECV_DUPLICATE;
+
+    /* Offset into the window above the cumulative point (0-based). */
+    uint32_t offset = sequence - rx->cumulative - 1u;
+    if (offset >= (uint32_t)CONDUIT_RECV_WINDOW)
+        return CONDUIT_RECV_INVALID; /* too far ahead to track */
+
+    uint64_t bit = (uint64_t)1u << offset;
+    if (rx->bitmap & bit)
+        return CONDUIT_RECV_DUPLICATE; /* seen this one already */
+
+    /* New: record it, then absorb any run of received sequences starting just
+     * above the cumulative point, advancing the window forward. */
+    rx->bitmap |= bit;
+    while (rx->bitmap & 1u)
+    {
+        rx->bitmap >>= 1;
+        rx->cumulative++;
+    }
+    return CONDUIT_RECV_NEW;
+}
+
+uint32_t conduit_rx_ack(const conduit_rx *rx)
+{
+    return rx->cumulative;
+}
+
+/* ============================================================================
+ * Reliability: sender (Section 4.3, 4.5)
+ * ========================================================================== */
+
+/* Update the Jacobson/Karels RTO estimator from one RTT sample (ms). */
+static void tx_update_rto(conduit_tx *tx, uint32_t sample_ms)
+{
+    if (!tx->have_srtt)
+    {
+        tx->srtt_ms = sample_ms;
+        tx->rttvar_ms = sample_ms / 2u;
+        tx->have_srtt = 1;
+    }
+    else
+    {
+        /* rttvar = (3*rttvar + |srtt - sample|) / 4 */
+        uint32_t diff = (tx->srtt_ms > sample_ms)
+                            ? (tx->srtt_ms - sample_ms)
+                            : (sample_ms - tx->srtt_ms);
+        tx->rttvar_ms = (3u * tx->rttvar_ms + diff) / 4u;
+        /* srtt = (7*srtt + sample) / 8 */
+        tx->srtt_ms = (7u * tx->srtt_ms + sample_ms) / 8u;
+    }
+    uint32_t rto = tx->srtt_ms + 4u * tx->rttvar_ms;
+    if (rto < tx->rto_min_ms)
+        rto = tx->rto_min_ms;
+    tx->rto_base_ms = rto;
+}
+
+void conduit_tx_init(conduit_tx *tx, uint32_t peer_cid,
+                     uint32_t initial_rto_ms, uint32_t rto_min_ms,
+                     uint32_t rto_max_ms)
+{
+    memset(tx, 0, sizeof(*tx));
+    tx->peer_cid = peer_cid;
+    tx->next_seq = 1; /* sequence 0 is reserved */
+    tx->base_ack = 0;
+    tx->have_srtt = 0;
+    tx->rto_base_ms = initial_rto_ms;
+    tx->rto_min_ms = rto_min_ms;
+    tx->rto_max_ms = rto_max_ms;
+}
+
+int conduit_tx_can_send(const conduit_tx *tx)
+{
+    return tx->outstanding < (uint32_t)CONDUIT_SEND_WINDOW;
+}
+
+/* Find a free slot, or NULL if the window is full. */
+static conduit_tx_slot *tx_free_slot(conduit_tx *tx)
+{
+    for (int i = 0; i < CONDUIT_SEND_WINDOW; i++)
+        if (!tx->slots[i].in_use)
+            return &tx->slots[i];
+    return NULL;
+}
+
+size_t conduit_tx_send(conduit_tx *tx, const uint8_t *payload, size_t payload_len,
+                       uint64_t now_ms, uint8_t *out, size_t cap)
+{
+    if (payload_len > CONDUIT_MAX_PAYLOAD)
+        return 0;
+    if (!conduit_tx_can_send(tx))
+        return 0;
+
+    uint32_t seq = tx->next_seq;
+    size_t n = conduit_build_data(tx->peer_cid, seq, payload, payload_len, out, cap);
+    if (n == 0)
+        return 0; /* buffer too small: do not consume the sequence */
+
+    conduit_tx_slot *s = tx_free_slot(tx);
+    /* can_send() guaranteed a slot exists. */
+    s->in_use = 1;
+    s->sequence = seq;
+    s->payload_len = payload_len;
+    if (payload_len > 0)
+        memcpy(s->payload, payload, payload_len);
+    s->last_send_ms = now_ms;
+    s->rto_ms = tx->rto_base_ms;
+    s->rexmit_at_ms = now_ms + s->rto_ms;
+    s->transmits = 1;
+
+    tx->next_seq++;
+    tx->outstanding++;
+    return n;
+}
+
+size_t conduit_tx_tick(conduit_tx *tx, uint64_t now_ms, uint8_t *out, size_t cap)
+{
+    /* Retransmit the first outstanding packet that is due. Returning one per
+     * call keeps the buffer contract simple; the caller loops until 0. */
+    for (int i = 0; i < CONDUIT_SEND_WINDOW; i++)
+    {
+        conduit_tx_slot *s = &tx->slots[i];
+        if (!s->in_use)
+            continue;
+        if (now_ms < s->rexmit_at_ms)
+            continue;
+
+        size_t n = conduit_build_data(tx->peer_cid, s->sequence,
+                                      s->payload, s->payload_len, out, cap);
+        if (n == 0)
+            return 0; /* buffer too small; try again next tick */
+
+        /* Back off this packet's RTO (doubling, capped) and reschedule. */
+        uint64_t doubled = (uint64_t)s->rto_ms * 2u;
+        s->rto_ms = (doubled > tx->rto_max_ms) ? tx->rto_max_ms : (uint32_t)doubled;
+        s->last_send_ms = now_ms;
+        s->rexmit_at_ms = now_ms + s->rto_ms;
+        s->transmits++; /* > 1 now: Karn's algorithm forbids an RTT sample */
+        return n;
+    }
+    return 0;
+}
+
+void conduit_tx_on_ack(conduit_tx *tx, uint32_t ack, uint64_t now_ms)
+{
+    /* Cumulative: an ack for N releases every outstanding packet <= N. */
+    if (ack <= tx->base_ack)
+        return; /* stale or duplicate ack: nothing new to release */
+    tx->base_ack = ack;
+
+    for (int i = 0; i < CONDUIT_SEND_WINDOW; i++)
+    {
+        conduit_tx_slot *s = &tx->slots[i];
+        if (!s->in_use || s->sequence > ack)
+            continue;
+
+        /* Karn's algorithm: only sample RTT from a packet sent exactly once. */
+        if (s->transmits == 1)
+        {
+            uint32_t sample = (uint32_t)(now_ms - s->last_send_ms);
+            tx_update_rto(tx, sample);
+        }
+        s->in_use = 0;
+        tx->outstanding--;
+    }
+}
+
+uint32_t conduit_tx_outstanding(const conduit_tx *tx)
+{
+    return tx->outstanding;
+}
+
+uint32_t conduit_tx_rto_ms(const conduit_tx *tx)
+{
+    return tx->rto_base_ms;
 }
