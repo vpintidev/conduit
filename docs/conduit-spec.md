@@ -2,9 +2,9 @@
 
 **A Modular, Layered Communication Protocol over UDP**
 
-- Draft: `draft-conduit-00`
+- Draft: `draft-conduit-01`
 - Status: Work in Progress — independent specification
-- Date: 2026-06-28
+- Date: 2026-07-06
 
 ## Abstract
 
@@ -28,7 +28,7 @@ This is not an IETF document and has not been reviewed or approved by any
 standards body. RFC numbers are assigned by the RFC Editor; an independent
 specification does not receive one. This document therefore adopts the
 Internet-Draft naming convention — a draft name and a two-digit revision
-(`draft-conduit-00`) — purely as a familiar, professional format. The revision
+(`draft-conduit-01`) — purely as a familiar, professional format. The revision
 number is incremented as the specification evolves.
 
 ## Conventions and Terminology
@@ -156,6 +156,7 @@ select the decryption context before any payload can be decrypted.
 | `0x02` | `HANDSHAKE_RESP`    | responder → initiator | Accept; carry CID and token    |
 | `0x03` | `HANDSHAKE_CONFIRM` | initiator → responder | Echo token; finish handshake   |
 | `0x10` | `DATA`              | either                | Application payload            |
+| `0x11` | `DATA_ACK`          | either                | Acknowledge reliable DATA      |
 | `0x20` | `HEARTBEAT`         | either                | Liveness probe; drives RTT     |
 | `0x21` | `HEARTBEAT_ACK`     | either                | Reply to a heartbeat           |
 | `0x30` | `CLOSE`             | either                | Best-effort connection close   |
@@ -182,11 +183,14 @@ the class boundaries fixed above.)
 
 ### 2.3. Optional Sections
 
-Following the fixed header, a packet MAY carry additional sections — reliability
-metadata (Section 4) and messaging metadata (Section 5) — whose presence is
-indicated by Flags bits defined in later revisions. When no such bits are set,
-the payload (if any) immediately follows the fixed header. These sections are
-not yet specified.
+Following the fixed header, a packet MAY carry additional sections whose presence
+is indicated by Flags bits defined in later revisions. When no such bits are set,
+the body (if any) immediately follows the fixed header. The reliability metadata
+of Section 4 (the `DATA` Sequence Number) is carried directly in the packet body
+of the relevant types rather than as a flag-signalled optional section; the
+flag-signalled optional-section mechanism is reserved for additive extensions
+such as selective acknowledgement (Section 4.2) and the messaging metadata of
+Section 5, which are specified where they are introduced.
 
 ## 3. Connection Lifecycle
 
@@ -351,9 +355,9 @@ CLOSE consists of the fixed header (Section 2.2) followed by a 1-octet Reason.
 
 CLOSE (type `0x30`), header Connection ID = destination CID:
 
-| Field  | Octets | Description                        |
-| ------ | ------ | ---------------------------------- |
-| Reason | 1      | Diagnostic reason for the closure  |
+| Field  | Octets | Description                       |
+| ------ | ------ | --------------------------------- |
+| Reason | 1      | Diagnostic reason for the closure |
 
 Defined Reason values:
 
@@ -378,8 +382,173 @@ already been closed locally MUST be discarded.
 
 ## 4. Reliability Model
 
-_To be specified:_ sequence numbers, acknowledgements, retransmission, duplicate
-detection, and ordering.
+This section defines OPTIONAL reliable delivery for `DATA` packets: a sender
+retransmits until its data is acknowledged, and a receiver discards duplicates.
+Reliability is a property of the sender/receiver state machines described here,
+layered on the fixed header (Section 2.2); it adds one packet type (`DATA_ACK`)
+and a Sequence Number to `DATA`.
+
+This revision provides reliability **without ordering**. A receiver delivers each
+`DATA` payload to the application as soon as it arrives, regardless of Sequence
+Number order; it never buffers out-of-order packets to reorder them. Ordered
+delivery is a separate, composable guarantee specified in Section 5. An
+application that needs in-order data uses that guarantee; an application that
+does not (for example, one exchanging independent records) avoids the
+head-of-line blocking that ordering would impose.
+
+### 4.1. Sequence Numbers
+
+Each reliable `DATA` packet carries a 32-bit Sequence Number in its body,
+immediately following the fixed header:
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                        Connection ID                          |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|     Type      |             Flags             |               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+               +
+|                       Sequence Number                         |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                        Payload ...                            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+`DATA` (type `0x10`), header Connection ID = destination CID:
+
+| Field           | Octets   | Description                               |
+| --------------- | -------- | ----------------------------------------- |
+| Sequence Number | 4        | Per-sender, per-connection sequence label |
+| Payload         | variable | Application data (MAY be empty)           |
+
+Sequence Numbers are assigned by the sender, one per reliable `DATA` packet, and
+increase by one for each new packet (not for each retransmission — a retransmit
+reuses the original number). The first reliable `DATA` on a connection uses
+Sequence Number 1; the value 0 is reserved and MUST NOT be assigned to a `DATA`
+packet. Sequence Numbers are per-direction: the two endpoints number their own
+`DATA` independently.
+
+Sequence Number wraparound (a connection sending more than 2³²−1 reliable
+packets) is not addressed in this revision; an implementation MAY treat it as a
+connection-fatal condition.
+
+### 4.2. Acknowledgements
+
+A receiver of reliable `DATA` reports progress with a `DATA_ACK` packet:
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                        Connection ID                          |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|     Type      |             Flags             |               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+               +
+|                    Acknowledgement Number                     |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+`DATA_ACK` (type `0x11`), header Connection ID = destination CID:
+
+| Field                  | Octets | Description                                  |
+| ---------------------- | ------ | -------------------------------------------- |
+| Acknowledgement Number | 4      | Highest Sequence Number received with no gap |
+
+The Acknowledgement Number is **cumulative**: it is the highest Sequence Number N
+such that every reliable `DATA` packet from 1 through N has been received. It
+acknowledges all of them at once. An Acknowledgement Number of 0 means no
+in-sequence `DATA` has been received yet.
+
+Because the acknowledgement is cumulative, a gap stalls it: if a receiver has
+seen 1, 2, 3, 5, 6 but not 4, it can only acknowledge 3, even though 5 and 6
+arrived. The sender therefore learns that 4 is missing (the acknowledgement does
+not advance past 3) but is not told that 5 and 6 are safe, and MAY retransmit
+them needlessly. This is the known cost of cumulative acknowledgement under loss.
+
+> **Planned refinement (selective acknowledgement).** A later revision will add
+> selective acknowledgement (SACK): the ability to report received ranges beyond
+> the cumulative point (e.g. "cumulative 3, plus 5–6"), so the sender retransmits
+> only the true gap. SACK is designed as an additive extension of the cumulative
+> scheme here — carried in an optional section signalled by a Flags bit
+> (Section 2.3) — and does not change the meaning of the Acknowledgement Number
+> field defined above. The cumulative field remains the baseline a receiver
+> always provides.
+
+A receiver SHOULD send a `DATA_ACK` promptly on receiving `DATA`. It MAY
+acknowledge less than once per packet (for instance, one `DATA_ACK` per batch of
+received packets), since the cumulative number already summarizes all progress;
+an implementation MUST NOT rely on a one-to-one correspondence between `DATA` and
+`DATA_ACK`.
+
+### 4.3. Retransmission and the Retransmission Timeout (RTO)
+
+A reliable sender retains each unacknowledged `DATA` packet and the time it was
+sent. If the Acknowledgement Number has not advanced to cover a packet within
+the current RTO, the sender retransmits that packet (reusing its Sequence
+Number). Repeated retransmissions of the same packet SHOULD back off (a doubling
+RTO, up to a cap) to avoid adding load to a lossy or congested path, mirroring
+the handshake's loss handling (Section 3.1.2).
+
+The RTO is derived adaptively from measured round-trip time, following the
+standard smoothed-estimate approach (Jacobson/Karels): the sender maintains a
+smoothed RTT and an RTT variation estimate, updates both from each RTT sample,
+and sets the RTO to the smoothed RTT plus a multiple of the variation, clamped to
+a minimum. Before any sample is available, the sender uses a conservative initial
+RTO.
+
+**RTT samples come from the data path itself.** When a `DATA_ACK` advances the
+Acknowledgement Number to cover a packet that was sent exactly once, the sender
+has a fresh RTT sample: the elapsed time between sending that packet and
+receiving the acknowledgement. This makes reliability self-contained — it
+measures RTT from its own traffic and does not depend on the keep-alive heartbeat
+(Section 3.2), which by design is silent while data flows.
+
+**Karn's algorithm — do not sample retransmitted packets.** If a packet was
+retransmitted, an arriving acknowledgement is ambiguous: it cannot be attributed
+to the original transmission or a retransmission, so the elapsed time is not a
+valid RTT sample. A sender MUST NOT take an RTT sample from a packet that has
+been retransmitted. It takes samples only from packets acknowledged on their
+first transmission. (The backoff above still applies to the retransmitted packet
+regardless.)
+
+### 4.4. Duplicate Detection
+
+Retransmission can cause a receiver to see the same Sequence Number more than
+once; reordering in the network can also deliver a packet whose number is below
+the cumulative point. A receiver MUST detect and discard such duplicates,
+delivering each Sequence Number's payload to the application at most once.
+
+A receiver tracks received Sequence Numbers with a sliding window: the cumulative
+Acknowledgement Number (all numbers at or below it have been received and
+delivered) plus a fixed-width bitmap recording which numbers just above it have
+been received. On receiving a reliable `DATA` packet with Sequence Number S:
+
+- If S is at or below the cumulative point, or its bit is already set in the
+  bitmap, it is a duplicate: the receiver discards the payload but SHOULD still
+  send a `DATA_ACK` (the sender's copy of the acknowledgement may have been lost).
+- Otherwise S is new: the receiver delivers the payload, records S (sets its bit,
+  or advances the cumulative point), and lets the window slide forward as the
+  cumulative point advances.
+
+A `DATA` packet whose Sequence Number is so far beyond the cumulative point that
+it falls outside the bitmap window MAY be discarded; the sender's window
+(Section 4.5) is bounded to keep this from happening in normal operation.
+
+### 4.5. Send Window
+
+A reliable sender MAY have multiple unacknowledged `DATA` packets outstanding at
+once (pipelining), up to a fixed send-window limit. When the number of
+unacknowledged packets reaches the limit, the sender MUST wait for the
+Acknowledgement Number to advance before sending new `DATA`; retransmissions of
+already-sent packets are not constrained by the limit.
+
+In this revision the send window is a fixed, configured value: it is a mechanism
+for pipelining, not yet a congestion-control signal. Dynamic adjustment of the
+window in response to loss and delay (congestion control) is deferred to a later
+circle. The sender's window MUST NOT exceed the receiver's duplicate-detection
+window (Section 4.4), so that a packet within the sender's window always falls
+within the receiver's tracking range.
 
 ## 5. Channels and Messages
 
@@ -418,3 +587,13 @@ trusted.
   symmetric teardown with no half-close, and reliance on the keep-alive timeout
   when a CLOSE is lost. Remaining lifecycle and wire-format sections are
   placeholders pending implementation.
+- `draft-conduit-01` — Section 4 (Reliability Model) defines OPTIONAL reliable,
+  unordered delivery for `DATA`: a 4-octet Sequence Number in the `DATA` body
+  (Section 4.1); a cumulative `DATA_ACK` packet, type `0x11` (Section 4.2), with
+  selective acknowledgement noted as a planned additive refinement; adaptive
+  retransmission with a Jacobson/Karels RTO sampled from the data path itself and
+  Karn's algorithm for retransmitted packets (Section 4.3); sliding-window
+  duplicate detection (Section 4.4); and a fixed pipelining send window, with
+  dynamic congestion control deferred (Section 4.5). Packet type `0x11`
+  (`DATA_ACK`) added to Section 2.2. Ordered delivery remains a separate
+  guarantee pending in Section 5.
