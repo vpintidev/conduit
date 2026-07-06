@@ -18,10 +18,11 @@ EXAMPLE_BIN := $(BUILD)/udp_hello
 PING_BIN    := $(BUILD)/conduit_ping
 HS_BIN      := $(BUILD)/conduit_handshake
 RTT_BIN     := $(BUILD)/conduit_rtt
+RELIABLE_BIN := $(BUILD)/conduit_reliable
 
-.PHONY: all test example ping handshake rtt clean
+.PHONY: all test example ping handshake rtt reliable clean
 
-all: $(TEST_BIN) $(EXAMPLE_BIN) $(PING_BIN) $(HS_BIN) $(RTT_BIN)
+all: $(TEST_BIN) $(EXAMPLE_BIN) $(PING_BIN) $(HS_BIN) $(RTT_BIN) $(RELIABLE_BIN)
 
 # Compile the library object once; the test links against it.
 $(LIB_OBJ): $(LIB_SRC) src/conduit.h | $(BUILD)
@@ -59,6 +60,13 @@ $(RTT_BIN): examples/conduit_rtt.c $(LIB_OBJ) | $(BUILD)
 	$(CC) $(CFLAGS) $< $(LIB_OBJ) -o $@
 
 rtt: $(RTT_BIN)
+
+# conduit_reliable demonstrates reliable DATA (sequences, cumulative acks,
+# retransmission); links the library.
+$(RELIABLE_BIN): examples/conduit_reliable.c $(LIB_OBJ) | $(BUILD)
+	$(CC) $(CFLAGS) $< $(LIB_OBJ) -o $@
+
+reliable: $(RELIABLE_BIN)
 
 $(BUILD):
 	mkdir -p $(BUILD)
