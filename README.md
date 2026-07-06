@@ -11,10 +11,11 @@ built for distributed systems on controlled networks (private clusters, backend
 fabrics, game servers, telemetry pipelines), not as a replacement for TCP, QUIC,
 or HTTP.
 
-> **Status:** Work in progress, developed as a learning project. The core of
-> Circle 1 works today: two peers establish a logical connection over UDP, keep
-> it alive, measure round-trip time, and detect when the peer goes away. The wire
-> format and reference implementation are built and documented incrementally.
+> **Status:** Work in progress, developed as a learning project. Circle 1 is
+> complete: two peers establish a logical connection over UDP with a
+> loss-tolerant handshake, keep it alive, measure round-trip time, detect when
+> the peer goes away, and close the connection explicitly. The wire format and
+> reference implementation are built and documented incrementally.
 
 ## Why
 
@@ -30,15 +31,15 @@ pay for.
 
 Conduit is built in three concentric circles, each complete and usable on its own.
 
-**Circle 1 — Core** (nearly complete)
+**Circle 1 — Core** (complete)
 
 - [x] Logical connections over UDP with connection IDs
 - [x] Fixed packet header (encode / decode with validation)
 - [x] Three-message handshake (INIT / RESP / CONFIRM) with address-validation token
+- [x] Handshake retransmission on packet loss (exponential backoff)
 - [x] Keep-alive heartbeats and round-trip-time (RTT) measurement
 - [x] Dead-peer detection via unacknowledged probes
-- [ ] Explicit connection close (CLOSE)
-- [ ] Handshake retransmission on packet loss
+- [x] Explicit connection close (CLOSE) with a diagnostic reason code
 
 **Circle 2 — Composable guarantees** (planned)
 
@@ -58,7 +59,7 @@ conduit/
 │   ├── conduit-spec.md      # the wire-format specification (RFC-style)
 │   └── TESTING.md           # testing strategy and tooling
 ├── src/
-│   ├── conduit.h            # public API: packet, handshake, liveness
+│   ├── conduit.h            # public API: packet, handshake, liveness, close
 │   └── conduit.c            # implementation
 ├── tests/
 │   ├── test.h               # minimal, zero-dependency test helper
@@ -97,14 +98,19 @@ Each example is a small standalone program under `examples/`.
 - **conduit_ping** — builds a real Conduit header, sends it in a UDP datagram,
   and parses it back on the other side.
 - **conduit_handshake** — run a responder and an initiator and watch the
-  INIT → RESP → CONFIRM exchange establish a connection.
+  INIT → RESP → CONFIRM exchange establish a connection. Pass `--drop N` to
+  either side to drop the first N handshake packets it receives, so you can watch
+  the initiator retransmit INIT on its backoff and still complete the handshake.
 - **conduit_rtt** — run two peers (`a` and `b`); they keep each other alive with
-  heartbeats and measure RTT. Kill one and the other reports the connection lost.
+  heartbeats and measure RTT. Ctrl-C one and it sends a best-effort CLOSE, so the
+  other reports the connection closed at once; kill it abruptly instead (no
+  CLOSE) and the other falls back to reporting the connection lost after a few
+  unanswered probes.
 
 To watch any of these on the wire (loopback):
 
 ```sh
-sudo tcpdump -i lo -X udp port 9000
+sudo tcpdump -i lo -X udp port 9000 or udp port 9001
 ```
 
 ## Testing
